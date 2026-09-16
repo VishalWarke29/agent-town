@@ -131,8 +131,8 @@ test('applying a reviewed hook keeps native trust and real event verification se
   await evidence.publish();
   await page.getByRole('button', { name: 'Apply reviewed Agent Town hook', exact: true }).click();
   const review = page.getByRole('article', { name: 'Review observation hook setup', exact: true });
-  await expect(review).toContainText('Configured');
-  await expect(review).toContainText('Review in the native tool');
+  await expect(review).toContainText('Hook file is on disk.');
+  await expect(review).toContainText('Native trust still needs review in the tool.');
   await expect(page.locator('.observation-connections')).toContainText('No event received');
   await expect(page.locator('.observation-connections')).not.toContainText('Receiving events');
   expect(evidence.calls.find(call => call.path === `${prefix}/connections`)?.body).toMatchObject({ nativeSourceId: sourceId, repoId: 'project', provider: 'codex' });

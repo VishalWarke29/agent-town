@@ -36,6 +36,7 @@ async function uiFixture(page: Page, longNames = false) {
     if (route.request().method() !== 'GET') mutations.push(`${route.request().method()} ${path}`);
     if (path.endsWith('/snapshot')) { await route.fulfill({ json: snapshot }); return; }
     if (path.endsWith('/services')) { await route.fulfill({ json: { sources: [], traffic: [], inventories: snapshot.state.telemetry!.inventories, coverage: snapshot.state.telemetry!.coverage } }); return; }
+    if (path.endsWith('/reports')) { await route.fulfill({ json: { reports: [], reportCount: 0, reportsNextOffset: null } }); return; }
     unexpected.push(path);
     await route.fulfill({ status: 404, json: { message: 'Unexpected UI fixture request.' } });
   });
