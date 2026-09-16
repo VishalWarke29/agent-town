@@ -163,6 +163,23 @@ describe('Economy connections and budget boundaries', () => {
     expect(() => store.commit('reserve-four', state => { reserveOperation(state, { ...request, id: 'four' }, time()); return 'reserved'; })).toThrow('Reconcile');
   });
 
+  it('warns at 80% of the run budget without blocking, and still throws once the run budget is reached', async () => {
+    const { enable, store, model, time } = setup();
+    const config = await enable();
+    const request = { id: 'below', runId: 'run-warn', purpose: 'worker' as const, connectionId: config.connectionId!, model, amountMicroUsd: 79000, runBudgetMicroUsd: 100000 };
+    const reservations = () => workflowState(store.snapshot().state).reservations;
+    // Settle each reservation with usage costing exactly its uncached input-token count, so cumulative run spend is exact.
+    store.commit('reserve-below', state => { reserveOperation(state, request, time()); return 'reserved'; });
+    expect(reservations().find(item => item.id === 'below')?.nearLimit).toBe(false);
+    store.commit('settle-below', state => { settleReservation(state, 'below', { inputTokens: 79000, outputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, reasoningTokens: null, source: 'provider-reported' }, time()); return 'settled'; });
+    // Cumulative run spend (79000 settled + 1000 reserved) now sits at exactly 80% of the 100000 run budget: a warning, not a block.
+    store.commit('reserve-at-threshold', state => { reserveOperation(state, { ...request, id: 'at-threshold', amountMicroUsd: 1000 }, time()); return 'reserved'; });
+    expect(reservations().find(item => item.id === 'at-threshold')?.nearLimit).toBe(true);
+    // Pushing cumulative spend past the 100000 run budget still throws, unchanged from the existing hard cap.
+    expect(() => store.commit('reserve-over', state => { reserveOperation(state, { ...request, id: 'over', amountMicroUsd: 20001 }, time()); return 'reserved'; })).toThrow('remaining run allowance');
+    expect(reservations().some(item => item.id === 'over')).toBe(false);
+  });
+
   it('blocks model quality claims, stale pricing, and cost-policy timezone reset tricks', async () => {
     const { service, enable, addReport, advance } = setup();
     const config = await enable();

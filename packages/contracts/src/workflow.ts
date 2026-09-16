@@ -51,6 +51,8 @@ export interface BudgetReservation {
   amountMicroUsd: number; runBudgetMicroUsd: number; actualMicroUsd: number | null; usage: WorkflowUsage | null;
   status: 'reserved' | 'settled' | 'uncertain'; day: string; createdAt: string; settledAt: string | null;
   settlementSource: 'provider-usage' | 'user-reconciled' | 'not-sent' | 'provider-rejected' | null;
+  /** True once this reservation pushed run/daily/manager usage to 80% or more of its limit. Warning only; scheduling still succeeds. */
+  nearLimit?: boolean;
 }
 export interface ManagerJob {
   id: string; reportIds: string[]; connectionId: string; model: string; reservationId: string;

@@ -69,18 +69,24 @@ export function reserveOperation(state: TownState, request: ReserveRequest, now:
   if (runReservations.some(value => value.connectionId !== request.connectionId || value.purpose !== request.purpose || value.runBudgetMicroUsd !== request.runBudgetMicroUsd || JSON.stringify(value.model) !== JSON.stringify(model))) throw new WorkflowError('run_billing_locked', 'A run cannot change its selected billing connection, allowance, or model.');
   if (runReservations.some(value => value.status === 'uncertain')) throw new WorkflowError('usage_uncertain', 'Reconcile the uncertain operation before scheduling more work for this run.');
   const held = (value: BudgetReservation) => value.status === 'settled' ? value.actualMicroUsd! : value.amountMicroUsd;
-  if (runReservations.reduce((sum, value) => sum + held(value), request.amountMicroUsd) > request.runBudgetMicroUsd) throw new WorkflowError('run_budget_reached', 'This request exceeds the remaining run allowance.');
+  // 4/5 avoids float rounding on the 80% early-warning threshold; still a plain > for the hard cap.
+  const near = (sum: number, limit: number) => sum * 5 >= limit * 4;
+  const runTotal = runReservations.reduce((sum, value) => sum + held(value), request.amountMicroUsd);
+  if (runTotal > request.runBudgetMicroUsd) throw new WorkflowError('run_budget_reached', 'This request exceeds the remaining run allowance.');
   const day = billingDay(now, policy.timeZone);
   // Old unsettled requests still consume allowance after midnight; no daily reset escape.
   const dayReservations = workflow.reservations.filter(value => value.day === day || value.status !== 'settled');
-  if (dayReservations.reduce((sum, value) => sum + held(value), request.amountMicroUsd) > policy.dailyBudgetMicroUsd) throw new WorkflowError('daily_budget_reached', 'The workspace daily budget has no room for this request.');
-  if (request.purpose === 'manager' && dayReservations.filter(value => value.purpose === 'manager').reduce((sum, value) => sum + held(value), request.amountMicroUsd) > policy.managerDailyBudgetMicroUsd) throw new WorkflowError('manager_budget_reached', 'The manager daily allowance has no room for this request.');
+  const dayTotal = dayReservations.reduce((sum, value) => sum + held(value), request.amountMicroUsd);
+  if (dayTotal > policy.dailyBudgetMicroUsd) throw new WorkflowError('daily_budget_reached', 'The workspace daily budget has no room for this request.');
+  const managerTotal = request.purpose === 'manager' ? dayReservations.filter(value => value.purpose === 'manager').reduce((sum, value) => sum + held(value), request.amountMicroUsd) : 0;
+  if (request.purpose === 'manager' && managerTotal > policy.managerDailyBudgetMicroUsd) throw new WorkflowError('manager_budget_reached', 'The manager daily allowance has no room for this request.');
+  const nearLimit = near(runTotal, request.runBudgetMicroUsd) || near(dayTotal, policy.dailyBudgetMicroUsd) || (request.purpose === 'manager' && near(managerTotal, policy.managerDailyBudgetMicroUsd));
   const active = workflow.reservations.filter(value => value.status !== 'settled' && value.purpose === request.purpose);
   const activeRuns = new Set(active.map(value => value.runId));
   const concurrency = request.purpose === 'manager' ? 1 : policy.workerConcurrency;
   if (active.some(value => value.runId === request.runId) || activeRuns.size >= concurrency) throw new WorkflowError('concurrency_reached', 'Wait for the active operation or reconcile its usage before scheduling another.');
   if (workflow.reservations.length >= 10_000) throw new WorkflowError('usage_capacity', 'The local usage ledger is full. Export and apply a reviewed retention policy before more paid work.');
-  const result: BudgetReservation = { id: request.id, runId: request.runId, purpose: request.purpose, connectionId: connection.id, provider: connection.provider, mode: 'api', model: structuredClone(model), amountMicroUsd: request.amountMicroUsd, runBudgetMicroUsd: request.runBudgetMicroUsd, actualMicroUsd: null, usage: null, status: 'reserved', day, createdAt: now, settledAt: null, settlementSource: null };
+  const result: BudgetReservation = { id: request.id, runId: request.runId, purpose: request.purpose, connectionId: connection.id, provider: connection.provider, mode: 'api', model: structuredClone(model), amountMicroUsd: request.amountMicroUsd, runBudgetMicroUsd: request.runBudgetMicroUsd, actualMicroUsd: null, usage: null, status: 'reserved', day, createdAt: now, settledAt: null, settlementSource: null, nearLimit };
   workflow.reservations.push(result);
   return result;
 }
