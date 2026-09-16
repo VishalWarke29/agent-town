@@ -212,6 +212,38 @@ describe('repository setup API', () => {
     expect(store.snapshot().state.repositories).toEqual([]);
   });
 
+  it('runs a five-minute GitHub background refresh per connected workspace and backs off for one cycle after a rate limit', async () => {
+    store.commit('fixture-seed', state => { state.discovery!.candidates = [remote('github-one')]; state.discovery!.githubListing = { checkedAt: before, status: 'complete', installationCount: 1, installationTotal: 1, repositoryTotal: 1, receivedCount: 1, retainedCount: 1, selectableCount: 1, reasons: [] }; return 'fixture'; });
+    const disconnected = new Store(':memory:', privateState({ id: 'fixture-workspace-unconnected', name: 'Unconnected', kind: 'personal' }));
+    let call = 0;
+    const background = vi.fn(async () => {
+      call++;
+      if (call === 2) throw new IdentityError('github_access_limited', 'GitHub denied access or limited requests.', 503);
+      return listing(1);
+    });
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      closeRepository = registerRepositoryApi(app, { store: () => store, listGitHub: async () => listing(), listGitHubBackground: background, stores: () => [store, disconnected] });
+      // Tick 1 (five minutes): the connected workspace is refreshed; the never-connected one is left alone.
+      await vi.advanceTimersByTimeAsync(300000);
+      expect(background).toHaveBeenCalledTimes(1);
+      expect(background).toHaveBeenCalledWith(store);
+      expect(store.snapshot().state.discovery!.githubListing).toMatchObject({ status: 'complete', checkedAt: before });
+      expect(disconnected.snapshot().state.discovery!.githubListing).toBeUndefined();
+      // Tick 2: this call simulates a GitHub rate limit.
+      await vi.advanceTimersByTimeAsync(300000);
+      expect(background).toHaveBeenCalledTimes(2);
+      expect(store.snapshot().state.discovery!.githubListing).toMatchObject({ status: 'failed', reasons: ['github_access_limited'] });
+      // Tick 3: backs off instead of calling again immediately.
+      await vi.advanceTimersByTimeAsync(300000);
+      expect(background).toHaveBeenCalledTimes(2);
+      // Tick 4: resumes on the next scheduled cycle.
+      await vi.advanceTimersByTimeAsync(300000);
+      expect(background).toHaveBeenCalledTimes(3);
+      expect(store.snapshot().state.discovery!.githubListing).toMatchObject({ status: 'complete' });
+    } finally { vi.useRealTimers(); disconnected.close(); }
+  });
+
   it('requires a fresh removal review and preserves repository metadata and all files on disconnect', async () => {
     store.commit('fixture-seed', state => { state.discovery!.roots = [fixture]; state.repositories = [{ ...local('local-one'), selectedRoot: fixture, localPath: fixture }]; return 'fixture'; });
     closeRepository = registerRepositoryApi(app, { store: () => store, listGitHub: async () => listing() });

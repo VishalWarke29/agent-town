@@ -10,7 +10,8 @@ import { checkedPath } from './discovery/paths.js';
 import { markLocalAttemptIncomplete, reconcileGitHubDiscovery, reconcileLocalDiscovery } from './repository-state.js';
 import { requireRepositoryRemovable, rootRemovalReview } from './history-state.js';
 
-interface Dependencies { store(request: FastifyRequest): Store; stores?(): Store[]; listGitHub(request: FastifyRequest): Promise<GitHubRepositoryListing>; refreshIntervalMs?: number; discover?: typeof discoverRepositories }
+interface Dependencies { store(request: FastifyRequest): Store; stores?(): Store[]; listGitHub(request: FastifyRequest): Promise<GitHubRepositoryListing>; listGitHubBackground?(store: Store): Promise<GitHubRepositoryListing>; refreshIntervalMs?: number; githubRefreshIntervalMs?: number; discover?: typeof discoverRepositories }
+const githubSafeCodes = ['github_unauthorized', 'github_access_limited', 'github_permissions_too_broad', 'github_listing_cancelled', 'github_listing_timeout', 'github_unavailable', 'github_response_invalid', 'github_not_connected'];
 const colors = ['#859b87', '#bc9782', '#c6ad71', '#829ca3', '#a78caa'];
 const position = (index: number): [number, number] => index < 3 ? [[-6, -3.3], [5.7, -3.8], [-5, 5.5]][index] as [number, number] : [18 + ((index - 3) % 5) * 8, -4 + Math.floor((index - 3) / 5) * 8];
 
@@ -234,26 +235,19 @@ export function registerRepositoryApi(app: FastifyInstance, dependencies: Depend
     return { operation };
   });
 
-  app.post(`${prefix}/github/repositories`, async request => {
-    const store = dependencies.store(request);
-    const workspaceId = store.snapshot().state.workspace.id;
-    if (closing) throw new IdentityError('SHUTTING_DOWN', 'The service is shutting down.', 503);
-    if (listings.has(workspaceId)) throw new IdentityError('GITHUB_LIST_RUNNING', 'A GitHub repository check is already running. Wait for its result.', 409);
-    const work = (async () => {
-    let result: GitHubRepositoryListing;
-    try { result = await dependencies.listGitHub(request); }
-    catch (error) {
-      dependencies.store(request);
-      if (!closing) store.commit(`github-failed:${randomUUID()}`, (state, now) => {
-        const safeCodes = ['github_unauthorized', 'github_access_limited', 'github_permissions_too_broad', 'github_listing_cancelled', 'github_listing_timeout', 'github_unavailable', 'github_response_invalid', 'github_not_connected'];
-        const reason = error instanceof IdentityError && safeCodes.includes(error.code) ? error.code : 'github_unavailable';
-        reconcileGitHubDiscovery(state, [], { checkedAt: now, status: 'failed', installationCount: null, installationTotal: null, repositoryTotal: null, receivedCount: 0, reasons: [reason] });
-        return 'repository.github_failed';
-      });
-      throw error;
-    }
-    dependencies.store(request);
-    if (closing) throw new IdentityError('SHUTTING_DOWN', 'The service is shutting down.', 503);
+  // Shared by the manual button and the periodic background refresh below, so both
+  // paths record failures/successes (and rate-limit backoff) identically.
+  const githubBackoff = new Set<string>();
+  const commitGithubFailure = (store: Store, workspaceId: string, error: unknown) => {
+    const reason = error instanceof IdentityError && githubSafeCodes.includes(error.code) ? error.code : 'github_unavailable';
+    if (reason === 'github_access_limited') githubBackoff.add(workspaceId); else githubBackoff.delete(workspaceId);
+    store.commit(`github-failed:${randomUUID()}`, (state, now) => {
+      reconcileGitHubDiscovery(state, [], { checkedAt: now, status: 'failed', installationCount: null, installationTotal: null, repositoryTotal: null, receivedCount: 0, reasons: [reason] });
+      return 'repository.github_failed';
+    });
+  };
+  const commitGithubSuccess = (store: Store, workspaceId: string, result: GitHubRepositoryListing) => {
+    githubBackoff.delete(workspaceId);
     const repositories: Repository[] = result.repositories.map((repo, index) => ({
       id: `github-${repo.id}`, githubId: Number(repo.id), name: repo.fullName, description: 'Selected GitHub repository metadata. Connect a local checkout to observe local agents.', language: 'Unavailable', branch: repo.defaultBranch,
       color: colors[index % colors.length]!, position: position(index), source: 'github', githubUrl: repo.htmlUrl,
@@ -266,10 +260,52 @@ export function registerRepositoryApi(app: FastifyInstance, dependencies: Depend
     const saved = store.snapshot().state.discovery!;
     const returnedIds = new Set(repositories.map(repo => repo.id));
     return { repositories: saved.candidates.filter(repo => returnedIds.has(repo.id)), partial: saved.githubListing!.status !== 'complete', diagnostics: saved.githubListing };
+  };
+
+  app.post(`${prefix}/github/repositories`, async request => {
+    const store = dependencies.store(request);
+    const workspaceId = store.snapshot().state.workspace.id;
+    if (closing) throw new IdentityError('SHUTTING_DOWN', 'The service is shutting down.', 503);
+    if (listings.has(workspaceId)) throw new IdentityError('GITHUB_LIST_RUNNING', 'A GitHub repository check is already running. Wait for its result.', 409);
+    const work = (async () => {
+    let result: GitHubRepositoryListing;
+    try { result = await dependencies.listGitHub(request); }
+    catch (error) {
+      dependencies.store(request);
+      if (!closing) commitGithubFailure(store, workspaceId, error);
+      throw error;
+    }
+    dependencies.store(request);
+    if (closing) throw new IdentityError('SHUTTING_DOWN', 'The service is shutting down.', 503);
+    return commitGithubSuccess(store, workspaceId, result);
     })();
     listings.set(workspaceId, work);
     try { return await work; } finally { listings.delete(workspaceId); }
   });
+
+  // Background refresh: re-run the same GitHub listing for workspaces that have
+  // already established a GitHub connection (evidenced by a prior listing status),
+  // read-only and scoped to one workspace's own store per cycle. Skips a workspace
+  // for one cycle after that workspace's previous attempt hit a GitHub rate limit.
+  const refreshGithubBackground = (store: Store) => {
+    const state = store.snapshot().state;
+    const workspaceId = state.workspace.id;
+    if (closing || listings.has(workspaceId) || !state.discovery?.githubListing) return;
+    if (githubBackoff.delete(workspaceId)) return;
+    const work = (async () => {
+      let result: GitHubRepositoryListing;
+      try { result = await dependencies.listGitHubBackground!(store); }
+      catch (error) { if (!closing) commitGithubFailure(store, workspaceId, error); return; }
+      if (!closing) commitGithubSuccess(store, workspaceId, result);
+    })();
+    listings.set(workspaceId, work);
+    void work.finally(() => listings.delete(workspaceId));
+  };
+  const githubTimer = setInterval(() => {
+    if (closing || !dependencies.listGitHubBackground) return;
+    try { for (const store of dependencies.stores?.() ?? []) refreshGithubBackground(store); }
+    catch { app.log.error('GitHub background refresh could not read the workspace registry.'); }
+  }, dependencies.githubRefreshIntervalMs ?? 300000); githubTimer.unref();
 
   app.post(`${prefix}/repositories/select`, async request => {
     const store = dependencies.store(request);
@@ -299,5 +335,5 @@ export function registerRepositoryApi(app: FastifyInstance, dependencies: Depend
       if (state.discovery?.roots.length && !jobs.has(state.workspace.id)) { try { startScan(store, true); } catch { /* Retry on the next bounded reconciliation. */ } }
     } } catch { app.log.error('Repository reconciliation could not read the local registry.'); }
   }, dependencies.refreshIntervalMs ?? 60000); timer.unref();
-  return async () => { closing = true; clearInterval(timer); for (const id of watchers.keys()) clearWatchers(id); for (const job of jobs.values()) job.abort.abort(); await Promise.allSettled([...jobs.values()].map(job => job.promise).concat([...listings.values()].map(promise => promise.then(() => undefined)))); };
+  return async () => { closing = true; clearInterval(timer); clearInterval(githubTimer); for (const id of watchers.keys()) clearWatchers(id); for (const job of jobs.values()) job.abort.abort(); await Promise.allSettled([...jobs.values()].map(job => job.promise).concat([...listings.values()].map(promise => promise.then(() => undefined)))); };
 }
