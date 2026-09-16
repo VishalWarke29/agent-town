@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { Activity, ArrowDownToLine, ArrowUpRight, BookOpen, Check, ChevronDown, CircleHelp, ClipboardList, Compass, Feather, FileText, FolderGit2, Focus, GitBranch, GlassWater, Home, Layers3, Leaf, List, LoaderCircle, Maximize, Menu, Minus, Pause, Play, Plus, Radio, RotateCcw, Search, Settings2, ShieldCheck, Sparkles, Unplug, Users, Wallet, X, type LucideIcon } from 'lucide-react';
-import { DEMO_WORKSPACE, activityLabel, type Agent, type Repository, type TownState, type ManagerProposal } from '@agent-town/contracts';
+import { DEMO_WORKSPACE, activityLabel, type Agent, type Repository, type ToolSurface, type TownState, type ManagerProposal } from '@agent-town/contracts';
 import type { CameraAction, Selection } from './world/interaction';
 import { isActivityStale, ROOM_PAGE_SIZE } from './world/interaction';
 import { useWorldNavigation } from './useWorldNavigation';
@@ -42,11 +42,20 @@ function IconButton({ icon: Icon, label, onClick, active = false, disabled = fal
   return <button type="button" className={`icon-button ${active ? 'active' : ''}`} aria-label={label} title={label} onClick={onClick} disabled={disabled}><Icon size={19} strokeWidth={1.7} /></button>;
 }
 
+// Reveal List controls with room for their focus ring. Native focus alone can leave a
+// fractional edge clipped; world labels must never scroll (they are never in .list-view).
+function restoreListFocus(element: HTMLElement | null | undefined) {
+  element?.focus({ preventScroll: true });
+  if (element && document.activeElement === element && element.closest('.list-view')) element.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+}
+
 function Drawer({ side, title, viewKey, eyebrow, onClose, toolbar, children, demo = true, notice }: { side: 'left' | 'right'; title: string; viewKey?: string; eyebrow: string; onClose: () => void; toolbar?: ReactNode; children: ReactNode; demo?: boolean; notice?: ReactNode }) {
   const ref = useRef<HTMLDialogElement>(null);
   const focusedBeforeResize = useRef<HTMLElement | null>(null);
-  // Capture before React makes the opener's List/room container inert.
-  const [opener] = useState(() => ({ element: document.activeElement as HTMLElement | null, label: document.activeElement?.getAttribute('aria-label') }));
+  // Capture before React makes the opener's List/room container inert. A stable
+  // data-agent-id (when present) is preferred over aria-label text in the fallback
+  // lookup below, since two different agents can share the same display name.
+  const [opener] = useState(() => ({ element: document.activeElement as HTMLElement | null, label: document.activeElement?.getAttribute('aria-label'), agentId: document.activeElement?.getAttribute('data-agent-id') }));
   const [narrow, setNarrow] = useState(matchMedia('(max-width: 899px)').matches);
   useEffect(() => {
     const media = matchMedia('(max-width: 899px)');
@@ -62,10 +71,12 @@ function Drawer({ side, title, viewKey, eyebrow, onClose, toolbar, children, dem
       requestAnimationFrame(() => {
         if (drawer?.isConnected || document.activeElement?.closest('dialog[open]')) return;
         // Switching World/List can remount navigation while this drawer stays open.
-        const target = opener.element?.isConnected ? opener.element : opener.label ? document.querySelector<HTMLButtonElement>(`button[aria-label="${CSS.escape(opener.label)}"]`) : null;
+        const target = opener.element?.isConnected ? opener.element
+          : opener.agentId ? document.querySelector<HTMLButtonElement>(`button[data-agent-id="${CSS.escape(opener.agentId)}"]`)
+          : opener.label ? document.querySelector<HTMLButtonElement>(`button[aria-label="${CSS.escape(opener.label)}"]`) : null;
         const restorable = target && target !== document.body && target !== document.documentElement && !target.closest('[inert]') && target.getClientRects().length > 0;
-        if (restorable) target.focus({ preventScroll: true });
-        if (!restorable || document.activeElement !== target) document.querySelector<HTMLButtonElement>('button[aria-label="Open agents"]:not([inert] *)')?.focus({ preventScroll: true });
+        if (restorable) restoreListFocus(target);
+        if (!restorable || document.activeElement !== target) restoreListFocus(document.querySelector<HTMLButtonElement>('button[aria-label="Open agents"]:not([inert] *)'));
       });
     };
   }, []);
@@ -134,6 +145,7 @@ export function App() {
   const [selection, setSelection] = useState<Selection | null>(null);
   const [rosterOpen, setRosterOpen] = useState(false);
   const [trackingRepoId, setTrackingRepoId] = useState<string | null>(null);
+  const [trackingHint, setTrackingHint] = useState<{ provider?: ToolSurface; sourceId?: string; sessionId?: string } | null>(null);
   const [cameraMenu, setCameraMenu] = useState(false);
   const [activityNow, setActivityNow] = useState(Date.now);
   const repositoryOpener = useRef<HTMLElement | null>(null);
@@ -159,8 +171,12 @@ export function App() {
   const unavailable = useCallback(() => { setWebglUnavailable(true); setListView(true); }, []);
   const stopFollow = useCallback(() => setFollow(null), []);
   const openSection = (value: Section) => { setRosterOpen(false); setSection(current => current === value ? null : value); if (window.innerWidth < 900) setSelection(null); };
-  function openTracking(repoId?: string) {
-    setTrackingRepoId(repoId ?? state?.repositories.find(repo => repo.localPath)?.id ?? null);
+  function openTracking(context?: string | { repoId: string; provider?: ToolSurface; sourceId?: string; sessionId?: string }) {
+    const info = typeof context === 'string' ? { repoId: context } : context;
+    setTrackingRepoId(info?.repoId ?? state?.repositories.find(repo => repo.localPath)?.id ?? null);
+    // Only a specific inspected agent carries provider/source/session context; a
+    // generic "Set up tracking" entry point keeps today's default behavior instead.
+    setTrackingHint(info?.provider ? { provider: info.provider, sourceId: info.sourceId, sessionId: info.sessionId } : null);
     setRosterOpen(false); setSelection(null); setSection('connections');
     requestAnimationFrame(() => { const heading = document.getElementById('tracking-setup-heading'); heading?.scrollIntoView({ block: 'start', behavior: 'instant' }); heading?.focus({ preventScroll: true }); });
   }
@@ -200,14 +216,8 @@ export function App() {
         .flatMap(label => [...document.querySelectorAll<HTMLButtonElement>(`button[aria-label="${label}"]`)])
         .find(visibleTarget);
       const target = visibleTarget(opener) ? opener : house ?? navigation;
-      // Reveal List controls with room for their focus ring. Native focus alone
-      // can leave a fractional edge clipped; world labels must never scroll.
-      const restoreFocus = (element: HTMLElement | undefined) => {
-        element?.focus({ preventScroll: true });
-        if (element && document.activeElement === element && element.closest('.list-view')) element.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
-      };
-      restoreFocus(target);
-      if (target && document.activeElement !== target) restoreFocus(navigation);
+      restoreListFocus(target);
+      if (target && document.activeElement !== target) restoreListFocus(navigation);
       repositoryOpener.current = null;
     });
   }
@@ -230,7 +240,7 @@ export function App() {
   }, [selection]);
   useEffect(() => {
     setSection(null); setSelection(null); setFollow(null); setQuery(''); setDraftProposal(null);
-    setRosterOpen(false); setTrackingRepoId(null); setCameraMenu(false); setShowChildAgents(false); repositoryOpener.current = null;
+    setRosterOpen(false); setTrackingRepoId(null); setTrackingHint(null); setCameraMenu(false); setShowChildAgents(false); repositoryOpener.current = null;
     setCameraAction(current => ({ kind: 'reset', nonce: current.nonce + 1 }));
   }, [identity.workspaceId, identity.session?.user?.id]);
 
@@ -293,7 +303,7 @@ export function App() {
         {exploration.deskCount > 0 ? <div className="room-pages"><span aria-live="polite">Page {exploration.page + 1} of {exploration.pageCount} · {exploration.deskSlots.slice(exploration.page * ROOM_PAGE_SIZE, (exploration.page + 1) * ROOM_PAGE_SIZE).filter(id => id !== null).length} shown · {exploration.deskCount} desk residents</span>{exploration.pageCount > 1 && <span><button className="button" aria-label="Previous desks" disabled={exploration.page === 0} onClick={() => exploration.setPage(exploration.page - 1)}>Previous</button><button className="button" aria-label="Next desks" disabled={exploration.page === exploration.pageCount - 1} onClick={() => exploration.setPage(exploration.page + 1)}>Next</button></span>}</div> : <p className="room-summary">{exploration.residents.length ? 'No desk residents. Reports and inactive sessions are in the roster.' : town.connection === 'connected' ? 'No observed sessions for this repository.' : 'Waiting for session information.'}</p>}
       </section>}
 
-      {listView && <section className="list-view glass" inert={Boolean(section || selection || rosterOpen)} aria-label="Accessible town list"><div className="list-heading"><div><p className="eyebrow">THE SAME TOWN, A DIFFERENT VIEW</p><h1>{state.workspace.name}</h1></div><span className="sample-tag">{demo ? "Sample data" : "Private workspace"}</span></div><nav className="list-navigation" aria-label="List view navigation">{sections.map(item => <button className="button" key={item.id} aria-label={`Open ${item.label.toLowerCase()}`} onClick={() => openSection(item.id)}><item.icon size={15} />{item.label}</button>)}</nav>{webglUnavailable && <Note>The 3D world is unavailable in this browser. All available actions are accessible here.</Note>}{!demo && !exploration.repository && <><p className="muted small">{sessionSummary(state.agents)} in town</p><ChildAgentControl count={hierarchy.children.length} checked={showChildAgents} onChange={setShowChildAgents} /></>}{exploration.repository ? <RepositoryAgents key={exploration.repository.id} showChildAgents={showChildAgents} onShowChildAgents={setShowChildAgents} showControls={rosterOpen} state={state} repoId={exploration.repository.id} connected={town.connection === 'connected'} onSelect={id => select({ kind: 'agent', id })} onSetUpTracking={openTracking} /> : <table><caption>{demo ? "Sample agents and their current activities" : "Sessions in the live town and their current activities"}</caption><thead><tr><th>Agent</th><th>Assignment</th><th>Activity</th><th><span className="sr-only">Details</span></th></tr></thead><tbody>{presentedAgents.map(a => <tr key={a.id}><td><strong>{agentDisplayName(a)}</strong><small>{agentToolLabel(a, state)} · {a.role}</small><small>{hierarchy.unresolved.some(item => item.id === a.id) ? "Parent unavailable" : hierarchy.childrenById.get(a.id)?.length ? `${hierarchy.childrenById.get(a.id)!.length} child agents · open details` : hierarchy.parentById.has(a.id) ? "Child agent" : ""}</small></td><td>{a.task}</td><td><Status agent={a} connected={sourceConnected(a)} now={activityNow} /></td><td><button className="text-button" onClick={() => select({ kind: 'agent', id: a.id })} aria-label={`Inspect ${agentDisplayName(a)}`}>Inspect <ArrowUpRight size={14} /></button></td></tr>)}</tbody></table>}{!demo && state.agents.length === 0 && <p className="empty">No observed agent sessions yet. Repository discovery starts no agents.</p>}{!demo && state.repositories.some(repo => repo.localPath) && <button className="button" onClick={() => openTracking()}>Set up tracking</button>}{!demo && <button className="button" onClick={() => openSection("repositories")}><Plus size={16} />Connect repositories</button>}<div className="list-places">{state.repositories.map(r => <button className="button" key={r.id} onClick={() => select({ kind: 'repo', id: r.id })}><FolderGit2 size={16} />{r.name}</button>)}<button className="button" onClick={() => select({ kind: 'manager' })}><Sparkles size={16} />Town manager</button></div></section>}
+      {listView && <section className="list-view glass" inert={Boolean(section || selection || rosterOpen)} aria-label="Accessible town list"><div className="list-heading"><div><p className="eyebrow">THE SAME TOWN, A DIFFERENT VIEW</p><h1>{state.workspace.name}</h1></div><span className="sample-tag">{demo ? "Sample data" : "Private workspace"}</span></div><nav className="list-navigation" aria-label="List view navigation">{sections.map(item => <button className="button" key={item.id} aria-label={`Open ${item.label.toLowerCase()}`} onClick={() => openSection(item.id)}><item.icon size={15} />{item.label}</button>)}</nav>{webglUnavailable && <Note>The 3D world is unavailable in this browser. All available actions are accessible here.</Note>}{!demo && !exploration.repository && <><p className="muted small">{sessionSummary(state.agents)} in town</p><ChildAgentControl count={hierarchy.children.length} checked={showChildAgents} onChange={setShowChildAgents} /></>}{exploration.repository ? <RepositoryAgents key={exploration.repository.id} showChildAgents={showChildAgents} onShowChildAgents={setShowChildAgents} showControls={rosterOpen} state={state} repoId={exploration.repository.id} connected={town.connection === 'connected'} onSelect={id => select({ kind: 'agent', id })} onSetUpTracking={openTracking} /> : <table><caption>{demo ? "Sample agents and their current activities" : "Sessions in the live town and their current activities"}</caption><thead><tr><th>Agent</th><th>Assignment</th><th>Activity</th><th><span className="sr-only">Details</span></th></tr></thead><tbody>{presentedAgents.map(a => <tr key={a.id}><td><strong>{agentDisplayName(a)}</strong><small>{agentToolLabel(a, state)} · {a.role}</small><small>{hierarchy.unresolved.some(item => item.id === a.id) ? "Parent unavailable" : hierarchy.childrenById.get(a.id)?.length ? `${hierarchy.childrenById.get(a.id)!.length} child agents · open details` : hierarchy.parentById.has(a.id) ? "Child agent" : ""}</small></td><td>{a.task}</td><td><Status agent={a} connected={sourceConnected(a)} now={activityNow} /></td><td><button className="text-button" data-agent-id={a.id} onClick={() => select({ kind: 'agent', id: a.id })} aria-label={`Inspect ${agentDisplayName(a)}`}>Inspect <ArrowUpRight size={14} /></button></td></tr>)}</tbody></table>}{!demo && state.agents.length === 0 && <p className="empty">No observed agent sessions yet. Repository discovery starts no agents.</p>}{!demo && state.repositories.some(repo => repo.localPath) && <button className="button" onClick={() => openTracking()}>Set up tracking</button>}{!demo && <button className="button" onClick={() => openSection("repositories")}><Plus size={16} />Connect repositories</button>}<div className="list-places">{state.repositories.map(r => <button className="button" key={r.id} onClick={() => select({ kind: 'repo', id: r.id })}><FolderGit2 size={16} />{r.name}</button>)}<button className="button" onClick={() => select({ kind: 'manager' })}><Sparkles size={16} />Town manager</button></div></section>}
 
       </div>
 
@@ -304,7 +314,7 @@ export function App() {
         {section === 'tasks' && demo && <><p className="muted">{demo ? "A small board of sample assignments." : "No managed assignments yet. Task launching remains disabled."}</p>{state.agents.map(a => <button key={a.id} className="task-card" onClick={() => select({ kind: 'agent', id: a.id })}><Status agent={a} connected={sourceConnected(a)} now={activityNow} /><h3>{a.task}</h3><span>{agentDisplayName(a)} · {agentToolLabel(a, state)}</span></button>)}<Note>Prepare and approve real tasks in a private workspace after connecting an account and passing execution checks.</Note></>}
         {section === 'activity' && <><div className="section-summary"><span>{demo ? "Saved sample events" : "Saved workspace events"}</span><span className="mono">#{town.cursor}</span></div><ActivityFeed state={state} /><Note icon={Radio}>Updates come from the local event service. No provider is being polled.</Note></>}
         {section === 'services' && (demo ? <Note>API inventory and runtime telemetry belong to your private workspace. Sign in and connect a local repository to set them up.</Note> : <TelemetryPanel key={state.workspace.id} state={state} identity={identity} cursor={town.cursor} available={available} />)}
-        {section === 'connections' && <><WorkspaceSetup identity={identity} available={available && identity.connection === 'connected'} />{!demo && <ObservationPanel key={state.workspace.id} state={state} identity={identity} available={available} selectedRepoId={trackingRepoId} onRepoChange={setTrackingRepoId} />}{!demo ? (state.workflow ? <WorkflowConnections key={state.workspace.id} state={{ ...state, workflow: state.workflow }} identity={identity} available={available} /> : <WorkspaceReadiness />) : <><div className="feature-heading"><Unplug size={25} /><h3>A home for your tools.</h3><p>Connect AI billing accounts in a private workspace. GitHub sign-in and observation do not connect a billing account.</p></div><label className="field-label">Billing mode preview</label><div className="segmented" role="group" aria-label="Billing mode preview"><button aria-pressed={billing === 'subscription'} onClick={() => setBilling('subscription')}>Subscription</button><button aria-pressed={billing === 'api'} onClick={() => setBilling('api')}>API credits</button></div><p className="muted small">{billing === 'subscription' ? 'Use supported native account sessions. Existing subscriptions do not automatically include API credits.' : 'Use a personal or company API account. Each run will retain its approved account and budget.'}</p>{['OpenAI / Codex', 'Anthropic / Claude', 'Cursor', 'GitHub Copilot'].map((provider, i) => <div className="connection-row" key={provider}><span className={`provider-mark provider-${i}`}>{['O', 'A', 'C', 'G'][i]}</span><span><strong>{provider}</strong><small>Not connected</small></span><Unplug size={14} /></div>)}<Note icon={ShieldCheck}>In a private workspace, the first eligible connection stays the default for its provider and billing mode. No silent account switching.</Note></>}</>}
+        {section === 'connections' && <><WorkspaceSetup identity={identity} available={available && identity.connection === 'connected'} />{!demo && <ObservationPanel key={state.workspace.id} state={state} identity={identity} available={available} selectedRepoId={trackingRepoId} onRepoChange={setTrackingRepoId} initialProvider={trackingHint?.provider} initialSourceId={trackingHint?.sourceId} initialSessionId={trackingHint?.sessionId} />}{!demo ? (state.workflow ? <WorkflowConnections key={state.workspace.id} state={{ ...state, workflow: state.workflow }} identity={identity} available={available} /> : <WorkspaceReadiness />) : <><div className="feature-heading"><Unplug size={25} /><h3>A home for your tools.</h3><p>Connect AI billing accounts in a private workspace. GitHub sign-in and observation do not connect a billing account.</p></div><label className="field-label">Billing mode preview</label><div className="segmented" role="group" aria-label="Billing mode preview"><button aria-pressed={billing === 'subscription'} onClick={() => setBilling('subscription')}>Subscription</button><button aria-pressed={billing === 'api'} onClick={() => setBilling('api')}>API credits</button></div><p className="muted small">{billing === 'subscription' ? 'Use supported native account sessions. Existing subscriptions do not automatically include API credits.' : 'Use a personal or company API account. Each run will retain its approved account and budget.'}</p>{['OpenAI / Codex', 'Anthropic / Claude', 'Cursor', 'GitHub Copilot'].map((provider, i) => <div className="connection-row" key={provider}><span className={`provider-mark provider-${i}`}>{['O', 'A', 'C', 'G'][i]}</span><span><strong>{provider}</strong><small>Not connected</small></span><Unplug size={14} /></div>)}<Note icon={ShieldCheck}>In a private workspace, the first eligible connection stays the default for its provider and billing mode. No silent account switching.</Note></>}</>}
         {section === 'usage' && !demo && state.workflow && <EconomyPanel key={state.workspace.id} state={{ ...state, workflow: state.workflow }} identity={identity} available={available} />}
         {section === 'usage' && !demo && !state.workflow && <WorkspaceReadiness />}
         {section === 'usage' && demo && <><div className="usage-total"><span>{demo ? "AI credits used by this preview" : "AI credits used by Agent Town"}</span><strong>$0<span>.00</span></strong><small><Leaf size={14} /> This preview makes no AI requests</small></div><div className="policy-card"><span className="eyebrow">ECONOMY DEFAULT</span><h3><Leaf size={18} /> Economy mode</h3><p>Private workspaces use bounded summaries and models with a recorded quality review.</p><ul><li>Tracking and animation use no model calls.</li><li>Manager summaries are batched.</li><li>Higher-cost models require approval.</li><li>Each run keeps its selected billing account.</li></ul></div><Note>Provider credit balances are unavailable. Connect a billing account and explicitly enable spending limits in a private workspace before approving paid work.</Note></>}

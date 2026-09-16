@@ -1,14 +1,21 @@
-import type { Agent, TownState } from '@agent-town/contracts';
+import type { Agent, ToolSurface, TownState } from '@agent-town/contracts';
 import { agentDisplayName } from './agentDisplayName';
 import { sessionHierarchy } from './sessionHierarchy';
 import { ChildActivity } from './SessionPresentation';
+
+/** Best-effort reverse mapping from an agent's display provider to its raw native
+ * surface, used only when no connection record is available to give the exact one.
+ * Copilot is intentionally omitted: it is not safe to guess CLI vs VS Code from the
+ * display label alone, so that case leaves the tracking setup provider unresolved. */
+const providerByLabel: Partial<Record<Agent['provider'], ToolSurface>> = { Codex: 'codex', Claude: 'claude', Cursor: 'cursor', Other: 'custom' };
 
 function Timestamp({ value }: { value: string | null | undefined }) {
   return value && Number.isFinite(Date.parse(value)) ? <time dateTime={value}>{new Date(value).toLocaleString()}</time> : <>Not received</>;
 }
 
 export function NativeSessionDetails({ agent, state, connected, now, onSelect, onTracking }: {
-  agent: Agent; state: TownState; onSelect: (id: string) => void; onTracking: (repoId: string) => void;
+  agent: Agent; state: TownState; onSelect: (id: string) => void;
+  onTracking: (context: { repoId: string; provider?: ToolSurface; sourceId?: string; sessionId?: string }) => void;
   connected: boolean; now: number;
 }) {
   const sourceId = agent.discovery?.sourceId ?? agent.observation?.nativeSourceId;
@@ -21,6 +28,9 @@ export function NativeSessionDetails({ agent, state, connected, now, onSelect, o
   const connections = state.observation?.connections.filter(connection => connection.repoId === agent.repoId
     && (sourceId ? connection.nativeSourceId === sourceId : connection.id === agent.observation?.connectionId)) ?? [];
   const currentConnections = connections.filter(connection => connection.status !== 'revoked');
+  // The connection's own provider is exact (it distinguishes Copilot CLI from VS Code);
+  // fall back to the agent's display provider only when no connection exists yet.
+  const provider = connections[0]?.provider ?? providerByLabel[agent.provider];
   return <section className="native-session-inspector" aria-label="Native session details">
     {!agent.observation && <div className="note"><p><strong>Session found · work details not received</strong><br />This character was found in local session metadata. Its task, actions and results are unavailable until the native tool supplies them. Subscription sign-in verifies account access; it does not enable activity tracking.</p></div>}
     <dl className="facts">
@@ -47,7 +57,7 @@ export function NativeSessionDetails({ agent, state, connected, now, onSelect, o
       {connection.delivery?.status !== undefined && connection.delivery.status !== 'idle' && <p className="form-notice">{connection.delivery.message ?? 'Some events are waiting for delivery.'}</p>}
       {connection.diagnostics?.map(diagnostic => <p className="muted small" key={diagnostic.code}>{diagnostic.message}</p>)}
     </article>)}
-    <button className="button" onClick={() => onTracking(agent.repoId)}>Review activity tracking</button>
+    <button className="button" onClick={() => onTracking({ repoId: agent.repoId, provider, sourceId, sessionId })}>Review activity tracking</button>
     <p className="muted small">Task descriptions, changed files and reports depend on what the native tool supports and sends. Hook configuration alone does not prove delivery.</p>
   </section>;
 }

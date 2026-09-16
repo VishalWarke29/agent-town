@@ -1,9 +1,9 @@
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import Database from 'better-sqlite3';
 import Fastify from 'fastify';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { Store } from '../../apps/service/src/store';
 import { privateState } from '../../apps/service/src/workspaces';
 import { registerObservationApi } from '../../apps/service/src/observation/service';
@@ -57,6 +57,44 @@ describe('native setup API', () => {
     } finally {
       await api.close(); await app.close(); store.close(); other.close();
       if (!resolve(directory).startsWith(`${resolve(tmpdir())}${sep}agent-town-native-api-`)) throw new Error('Unsafe fixture cleanup');
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('detected native tool status', () => {
+  const saved = { CODEX_HOME: process.env.CODEX_HOME, CURSOR_CONFIG_DIR: process.env.CURSOR_CONFIG_DIR };
+  afterEach(() => { for (const [key, value] of Object.entries(saved)) if (value === undefined) delete process.env[key as keyof typeof saved]; else process.env[key as keyof typeof saved] = value; });
+
+  it('requires the Cursor SDK store file (not just its folder) to report detected, and reads Codex version from its local session store', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'agent-town-native-tools-'));
+    const codexHome = join(directory, 'codex'), cursorHome = join(directory, 'cursor'); mkdirSync(codexHome); mkdirSync(cursorHome);
+    const db = new Database(join(codexHome, 'state_5.sqlite'));
+    db.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,cwd TEXT,created_at INTEGER,updated_at INTEGER,archived INTEGER,cli_version TEXT)');
+    db.prepare('INSERT INTO threads VALUES(?,?,?,?,?,?)').run('older', '/repo', 1000, 1000, 0, '1.2.3');
+    db.prepare('INSERT INTO threads VALUES(?,?,?,?,?,?)').run('newer', '/repo', 1000, 2000, 0, '1.4.0');
+    db.close();
+    process.env.CODEX_HOME = codexHome; process.env.CURSOR_CONFIG_DIR = cursorHome;
+    const state = privateState({ id: 'native-tools-workspace', name: 'Fixture', kind: 'personal' });
+    const store = new Store(':memory:', state);
+    const app = Fastify();
+    app.setErrorHandler((error, _request, reply) => reply.code(error instanceof IdentityError ? error.statusCode : 500).send({ message: error instanceof Error ? error.message : 'Request failed' }));
+    const secrets = new Map<string, string>();
+    const api = registerObservationApi(app, { directory, vault: { available: true, async put(id, value) { secrets.set(id, value); }, async get(id) { return secrets.get(id) ?? null; }, async delete(id) { secrets.delete(id); } },
+      scoped: () => ({ ownerId: 'owner', store }), workspace: () => store });
+    try {
+      const before = await app.inject({ method: 'GET', url: '/api/v1/workspaces/native-tools-workspace/observation/native-setup' });
+      expect(before.statusCode).toBe(200);
+      const tools = before.json().tools as { provider: string; detected: boolean; version: string | null }[];
+      expect(tools.find(tool => tool.provider === 'cursor')).toMatchObject({ detected: false });
+      expect(tools.find(tool => tool.provider === 'codex')).toMatchObject({ detected: true, version: '1.4.0' });
+      writeFileSync(join(cursorHome, 'agents.ndjson'), '');
+      const after = await app.inject({ method: 'GET', url: '/api/v1/workspaces/native-tools-workspace/observation/native-setup' });
+      const toolsAfter = after.json().tools as { provider: string; detected: boolean }[];
+      expect(toolsAfter.find(tool => tool.provider === 'cursor')).toMatchObject({ detected: true });
+    } finally {
+      await api.close(); await app.close(); store.close();
+      if (!resolve(directory).startsWith(`${resolve(tmpdir())}${sep}agent-town-native-tools-`)) throw new Error('Unsafe fixture cleanup');
       rmSync(directory, { recursive: true, force: true });
     }
   });

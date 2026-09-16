@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import Database from 'better-sqlite3';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { nativeVisibilitySchema, registerNativeSourceSchema, scanNativeSourceSchema, surfaceSchema, type NativeSetupSnapshot, type NativeToolStatus } from '@agent-town/contracts';
 import type { Store } from '../store.js';
@@ -9,12 +10,33 @@ import { IdentityError } from '../identity/types.js';
 import { canonicalizeRoot, checkedPath } from '../discovery/paths.js';
 import { discoverNativeSessions } from '../native-discovery/index.js';
 
+/** Codex records its own CLI version per session in its local sqlite store (see
+ * metadata-worker.mjs's `cli_version` column); reading the most recent one is a
+ * read-only, file-based signal, never a shelled-out `--version` check. No other
+ * surface here has a known, reliable colocated version marker file, so their
+ * version stays null/Unavailable rather than a guessed or invented signal. */
+function codexVersion(homePath: string): string | null {
+  try {
+    const db = new Database(join(homePath, 'state_5.sqlite'), { readonly: true, fileMustExist: true, timeout: 100 });
+    try {
+      const row = db.prepare('SELECT cli_version FROM threads WHERE cli_version IS NOT NULL ORDER BY rowid DESC LIMIT 1').get() as { cli_version: unknown } | undefined;
+      return typeof row?.cli_version === 'string' && row.cli_version.trim() ? row.cli_version.trim().slice(0, 40) : null;
+    } finally { db.close(); }
+  } catch { return null; }
+}
+
 function detectedTools(): NativeToolStatus[] {
   const defaults = { codex: process.env.CODEX_HOME ?? join(homedir(), '.codex'), claude: process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), cursor: process.env.CURSOR_CONFIG_DIR ?? join(homedir(), '.cursor'), 'copilot-cli': process.env.COPILOT_HOME ?? join(homedir(), '.copilot'), 'copilot-vscode': process.env.APPDATA ? join(process.env.APPDATA, 'Code', 'User') : join(homedir(), '.config', 'Code', 'User'), custom: null };
   const labels = { codex: 'Codex desktop, CLI and editor', claude: 'Claude Code', cursor: 'Cursor local SDK store', 'copilot-cli': 'Copilot CLI', 'copilot-vscode': 'Copilot in VS Code', custom: 'Other local tool' };
-  return surfaceSchema.options.map(provider => ({ provider, label: labels[provider], detected: !!defaults[provider] && existsSync(defaults[provider]!), defaultHomePath: defaults[provider], version: null,
-    discovery: provider === 'copilot-vscode' || provider === 'custom' ? 'unsupported' : 'available',
-    message: provider === 'cursor' ? 'Discovery covers the selected local SDK store. Existing editor and CLI chats require a supported live hook; their history is not enumerated.' : provider === 'copilot-vscode' ? 'Profile directory detection does not verify the Copilot extension. Existing chat discovery is unavailable; configure VS Code hooks for future events.' : provider === 'custom' ? 'Register a local profile and use the normalized event bridge. Automatic history discovery is unavailable.' : 'Local profile detection does not verify authentication or live activity. Select and scan a profile to check its metadata interface.' }));
+  return surfaceSchema.options.map(provider => {
+    const home = defaults[provider];
+    // Cursor's actual requirement is the SDK's JSONL store file, not just the parent
+    // config folder; the folder alone overstates readiness for a scan (metadata-worker.mjs).
+    const detected = !!home && existsSync(provider === 'cursor' ? join(home!, 'agents.ndjson') : home!);
+    return { provider, label: labels[provider], detected, defaultHomePath: home, version: provider === 'codex' && detected ? codexVersion(home!) : null,
+      discovery: provider === 'copilot-vscode' || provider === 'custom' ? 'unsupported' : 'available',
+      message: provider === 'cursor' ? 'Discovery covers the selected local SDK store. Existing editor and CLI chats require a supported live hook; their history is not enumerated.' : provider === 'copilot-vscode' ? 'Profile directory detection does not verify the Copilot extension. Existing chat discovery is unavailable; configure VS Code hooks for future events.' : provider === 'custom' ? 'Register a local profile and use the normalized event bridge. Automatic history discovery is unavailable.' : 'Local profile detection does not verify authentication or live activity. Select and scan a profile to check its metadata interface.' };
+  });
 }
 
 export function registerNativeApi(app: FastifyInstance, scoped: (request: FastifyRequest) => { ownerId: string; store: Store }) {

@@ -2,17 +2,18 @@ import { agentDisplayName } from './agentDisplayName';
 import { SessionReports } from './SessionReports';
 import { useEffect, useRef, useState } from 'react';
 import { RefreshCw, Search, ShieldCheck } from 'lucide-react';
-import { activityLabel, type Agent, type NativeSessionPage, type NativeSetupSnapshot, type ToolSurface, type TownState } from '@agent-town/contracts';
+import { activityLabel, type Agent, type NativeSessionPage, type NativeSetupSnapshot, type NativeToolStatus, type ToolSurface, type TownState } from '@agent-town/contracts';
 import type { IdentityController } from './useIdentity';
 
 interface Props {
   state: TownState; identity: IdentityController; available: boolean;
   repoId: string; provider: ToolSurface; sourceId: string;
   onSourceChange: (id: string) => void;
+  onToolStatus?: (status: NativeToolStatus | null) => void;
 }
 
 /** Native inventory is deliberately separate from the event-driven town snapshot. */
-export function NativeTrackingPanel({ state, identity, available, repoId, provider, sourceId, onSourceChange }: Props) {
+export function NativeTrackingPanel({ state, identity, available, repoId, provider, sourceId, onSourceChange, onToolStatus }: Props) {
   const prefix = `/workspaces/${encodeURIComponent(state.workspace.id)}/observation`;
   const [setup, setSetup] = useState<NativeSetupSnapshot | null>(null);
   const [page, setPage] = useState<NativeSessionPage | null>(null);
@@ -34,6 +35,8 @@ export function NativeTrackingPanel({ state, identity, available, repoId, provid
   const tool = setup?.tools.find(item => item.provider === provider);
   const sources = setup?.sources.filter(item => item.provider === provider) ?? [];
   const source = sources.find(item => item.id === sourceId);
+
+  useEffect(() => { onToolStatus?.(tool ?? null); }, [tool, onToolStatus]);
 
   useEffect(() => {
     const controller = new AbortController();
