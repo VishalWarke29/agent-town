@@ -1,7 +1,8 @@
+import { resolve } from 'node:path';
 import { createApp } from './app.js';
 import { createDefaultIdentity } from './identity/index.js';
 import { applicationDataPaths, readLocalConfig } from './config.js';
-import { acquireDataDirectoryLock } from './ops/lock.js';
+import { acquireDataDirectoryLock, verifyDataScopeManifest } from './ops/lock.js';
 import { buildInfo } from './build-info.js';
 import { BackupScheduler } from './ops/scheduler.js';
 
@@ -10,12 +11,25 @@ if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('AGE
 const developmentWebPort = Number(process.env.AGENT_TOWN_WEB_PORT ?? 5173);
 if (!Number.isInteger(developmentWebPort) || developmentWebPort < 1024 || developmentWebPort > 65535) throw new Error('AGENT_TOWN_WEB_PORT must be between 1024 and 65535.');
 const config = readLocalConfig();
-const { database, privateDirectory } = applicationDataPaths(config.mode);
+const { directory, database, privateDirectory } = applicationDataPaths(config.mode);
+// Two different (mode, data base) combinations must never silently resolve to
+// the same physical directory (e.g. production with a custom base and
+// development pointed at that base's own "production" subfolder).
+const dataScope = { mode: config.mode, customBase: process.env.AGENT_TOWN_DATA_DIR ? resolve(process.env.AGENT_TOWN_DATA_DIR) : null };
+verifyDataScopeManifest(directory, dataScope);
+verifyDataScopeManifest(privateDirectory, dataScope);
 const release = acquireDataDirectoryLock(privateDirectory, 'service');
 process.once('exit', release);
 const identity = config.mode === 'demo' ? undefined : createDefaultIdentity(privateDirectory, config.githubClientId, () => readLocalConfig().githubClientId);
 const backups = config.mode === 'demo' ? undefined : new BackupScheduler({ sourceDirectory: privateDirectory });
-const { app } = await createApp({ database, privateDirectory, identity, backups, port, developmentWebPort, mode: config.mode, development: config.mode !== 'production' && process.env.NODE_ENV !== 'production', logger: true });
+// "development" (hot-reload advertising, dev-origin CORS allowance) must reflect
+// an actual dev supervisor, not just an unset/non-production NODE_ENV — a plain
+// `npm start`/`node dist/index.js` has neither NODE_ENV=production nor a dev
+// supervisor, but must still behave like a built, non-dev launch. Only
+// scripts/dev-service.mjs imports this module over an IPC-connected child
+// process, so process.connected is a reliable, un-spoofable dev-supervisor signal.
+const development = config.mode !== 'production' && process.connected === true;
+const { app } = await createApp({ database, privateDirectory, identity, backups, port, developmentWebPort, mode: config.mode, development, logger: true });
 let stopping = false;
 for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, () => {
   if (stopping) return;

@@ -2,6 +2,30 @@ import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, re
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 
+export interface DataScopeManifest { version: 1; mode: string; customBase: string | null; createdAt: string }
+
+/**
+ * Detects two different (mode, custom data base) combinations resolving to the
+ * same physical directory (e.g. production with base B and development with
+ * base B\production both landing on B\production\private) and refuses to
+ * start rather than let two environments silently share one database.
+ */
+export function verifyDataScopeManifest(directory: string, scope: { mode: string; customBase: string | null }): void {
+  const root = safeLocalDirectory(directory, true), path = join(root, '.agent-town-scope.json');
+  if (!existsSync(path)) {
+    writeFileSync(path, JSON.stringify({ version: 1, mode: scope.mode, customBase: scope.customBase, createdAt: new Date().toISOString() } satisfies DataScopeManifest), { mode: 0o600 });
+    return;
+  }
+  const info = lstatSync(path);
+  if (info.isSymbolicLink() || !info.isFile() || info.size > 4096) throw new Error(`Unexpected scope marker at ${path}. Remove it only if you understand why, then restart.`);
+  let manifest: DataScopeManifest;
+  try { manifest = JSON.parse(readFileSync(path, 'utf8')); }
+  catch { throw new Error(`The scope marker at ${path} is unreadable. Remove it only if you understand why, then restart.`); }
+  if (manifest.mode !== scope.mode || manifest.customBase !== scope.customBase) {
+    throw new Error(`This data directory (${root}) was previously used with application mode "${manifest.mode}"${manifest.customBase ? ` and data base "${manifest.customBase}"` : ''}, but this startup resolved mode "${scope.mode}"${scope.customBase ? ` and data base "${scope.customBase}"` : ''} to the same physical path. Refusing to start to avoid two environments silently sharing one database. Use a different AGENT_TOWN_DATA_DIR for one of them, or remove ${path} only if you are certain this reuse is intentional.`);
+  }
+}
+
 export class OperationsError extends Error {
   constructor(public readonly code: 'in-use' | 'unsafe-path' | 'invalid-backup' | 'destination-exists' | 'missing-data' | 'unsupported-schema' | 'backup-limit' | 'external-evidence') {
     super({ 'in-use': 'Stop Agent Town before this operation. Its data directory is in use.',
