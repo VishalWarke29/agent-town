@@ -1,0 +1,24 @@
+# This workflow only actually runs once/if this repository is pushed to a GitHub remote.
+#
+# Unit/type-check CI only: this intentionally does NOT run the Playwright end-to-end
+# suite (npm run test:e2e), since it needs a real browser and Windows-specific
+# launcher behavior that doesn't apply to a standard Linux CI runner. Browser e2e
+# coverage is run separately/locally for now.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
