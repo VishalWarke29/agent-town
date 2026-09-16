@@ -1,0 +1,10 @@
+Agent Town includes OpenTelemetry protocol definitions from
+https://github.com/open-telemetry/opentelemetry-proto/tree/v1.11.0
+
+Copyright The OpenTelemetry Authors.
+Licensed under the Apache License, Version 2.0; see the adjacent LICENSE file.
+
+The vendored .proto files are unmodified. descriptor.json is generated from
+those definitions using protobufjs. provenance.json records the pinned release
+and SHA-256 hash of every input. The generated descriptor does not grant any
+endorsement by the OpenTelemetry project.
