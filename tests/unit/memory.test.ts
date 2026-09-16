@@ -112,6 +112,28 @@ describe('immutable owner memory and context evidence', () => {
     expect(() => buildWorkerContext(store.snapshot().state, draft)).toThrow('no blocker or workspace decision was truncated');
     expect(provider.summarize).not.toHaveBeenCalled();
   });
+
+  it('filters worker context decisions and blockers to the relevant repo, so a different repo cannot block every draft workspace-wide', () => {
+    const { service, store, draft } = setup();
+    store.commit('add-other-repo', state => { state.repositories.push({ id: 'other-repo', name: 'Other', branch: 'main', description: '', language: '', color: '#abc', position: [1, 1] }); return 'fixture'; });
+    for (let index = 0; index < 14; index++) service.updateMemory({ action: 'accept-decision', expectedVersion: store.snapshot().state.manager.version, text: `${index}: ${'Other repo compatibility constraint. '.repeat(25)}`, repoId: 'other-repo', sourceReportIds: [] }, `other-decision-${index}`);
+    for (let index = 0; index < 5; index++) service.updateMemory({ action: 'open-blocker', expectedVersion: store.snapshot().state.manager.version, text: `Other repo blocker ${index}: ${'x'.repeat(400)}`, repoId: 'other-repo', sourceReportIds: [] }, `other-blocker-${index}`);
+    // Draft targets 'repo'; none of the above memory belongs there, so it must not appear and must not trip the 12,000-character ceiling.
+    const workerContext = JSON.parse(buildWorkerContext(store.snapshot().state, draft));
+    expect(workerContext.acceptedDecisions).toEqual([]);
+    expect(workerContext.blockers).toEqual([]);
+  });
+
+  it('caps workspace-wide decisions fed to the manager batch and reports the omitted count instead of growing unbounded', () => {
+    const { service, store, addReport } = setup();
+    for (let index = 0; index < 45; index++) service.updateMemory({ action: 'accept-decision', expectedVersion: store.snapshot().state.manager.version, text: `Decision ${index}.`, repoId: null, sourceReportIds: [] }, `decision-${index}`);
+    addReport('capped');
+    const bundle = buildManagerInput(store.snapshot().state, store.snapshot().state.handoffs);
+    const input = JSON.parse(bundle.input);
+    expect(input.acceptedDecisions).toHaveLength(40);
+    expect(input.omittedDecisionCount).toBe(5);
+    expect(input.acceptedDecisions[0].text).toBe('Decision 44.');
+  });
 });
 
 describe('zero-inference manager queue explanations', () => {
