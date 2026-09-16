@@ -127,6 +127,9 @@ async function safeGitMetadata(layout: GitLayout, roots: string[], limits: Disco
           if (['alternates', 'http-alternates'].includes(entry.name)) return 'unsupported-git-layout';
           const path = join(current, entry.name);
           if (entry.isSymbolicLink()) return 'unsafe-path';
+          // Git itself reads objects/refs when running status; confirm these top-level trees aren't links
+          // without individually checking every loose object or ref, which can number in the thousands.
+          if (['objects', 'refs'].includes(entry.name) && current === layout.commonDirectory) continue;
           const stat = await lstat(await checkedPath(path, roots));
           if (stat.isDirectory()) queue.push(path);
           else if (!stat.isFile()) return 'unsafe-path';

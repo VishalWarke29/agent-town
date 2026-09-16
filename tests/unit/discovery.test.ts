@@ -132,6 +132,24 @@ describe('selected-root repository discovery', () => {
     expect(cancelled.coverage.issues).toContain('cancelled');
   });
 
+  it('does not spend the shared entry budget walking a repository\'s ordinary loose objects', async () => {
+    const repo = await repository();
+    const objectCount = 3000;
+    let created = 0;
+    for (let fanout = 0; fanout < 256 && created < objectCount; fanout++) {
+      const dir = join(repo, '.git', 'objects', fanout.toString(16).padStart(2, '0'));
+      await mkdir(dir, { recursive: true });
+      for (let file = 0; file < Math.ceil(objectCount / 256) && created < objectCount; file++, created++) {
+        await writeFile(join(dir, file.toString(16).padStart(38, '0')), Buffer.from([0x78, 0x01, 0x00]));
+      }
+    }
+    const result = await discoverRepositories([fixture], { limits: { maxEntries: 2000 } });
+    expect(result.coverage.status).toBe('complete');
+    expect(result.coverage.entriesVisited).toBeLessThan(objectCount);
+    expect(result.repositories).toHaveLength(1);
+    expect(result.repositories[0].git).toMatchObject({ availability: 'available', branch: 'main', changedFiles: 0 });
+  });
+
   it('uses metadata fingerprints for refresh, detects edits and confirms removal only after a full scan', async () => {
     const repo = await repository();
     await writeFile(join(repo, 'AGENTS.md'), 'One');
