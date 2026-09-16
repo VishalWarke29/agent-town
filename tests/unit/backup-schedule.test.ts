@@ -75,19 +75,28 @@ describe('scheduled private database recovery', () => {
     expect(existsSync(join(restored, 'private', '.agent-town.lock'))).toBe(false);
   });
 
-  it('counts excluded spool, worktrees, execution copies and evidence without copying their contents', async () => {
+  it('counts excluded spool, worktrees and execution copies without copying their contents', async () => {
     const item = fixture();
-    for (const relative of ['observation/spool/connection/event.json', `managed/${item.workspace.id}/worktrees/run/source.txt`, `managed/${item.workspace.id}/execution/run/source/source.txt`, `workspaces/${item.workspace.id}/evidence/report.txt`]) {
+    for (const relative of ['observation/spool/connection/event.json', `managed/${item.workspace.id}/worktrees/run/source.txt`, `managed/${item.workspace.id}/execution/run/source/source.txt`]) {
       const parts = relative.split('/'), name = parts.pop()!; mkdirSync(join(item.source, ...parts), { recursive: true }); writeFileSync(join(item.source, ...parts, name), 'PRIVATE_EXCLUDED_MARKER');
     }
     const path = join(item.destination, 'coverage'), manifest = await createServiceBackup(item.source, path);
-    expect(manifest.coverage?.excluded).toEqual({ pendingSpool: { items: 1, exact: true }, worktrees: { items: 1, exact: true }, executionSources: { items: 1, exact: true }, externalEvidence: { items: 1, exact: true } });
+    expect(manifest.coverage?.excluded).toEqual({ pendingSpool: { items: 1, exact: true }, worktrees: { items: 1, exact: true }, executionSources: { items: 1, exact: true }, externalEvidence: { items: 0, exact: true } });
     expect(readdirSync(path).sort()).toEqual(['app.sqlite', 'manifest.json', 'workspaces']);
     for (const file of manifest.files) expect(readFileSync(join(path, file.path)).includes(Buffer.from('PRIVATE_EXCLUDED_MARKER'))).toBe(false);
     const unsafe = join(item.source, 'observation', 'spool', 'linked');
     symlinkSync(item.root, unsafe, process.platform === 'win32' ? 'junction' : 'dir');
     const second = await createServiceBackup(item.source, join(item.destination, 'linked-coverage'));
     expect(second.coverage?.excluded.pendingSpool.exact).toBe(false);
+  });
+
+  it('blocks scheduled backups while external evidence is present, leaving it untouched', async () => {
+    const item = fixture(), evidence = join(item.source, 'workspaces', item.workspace.id, 'evidence');
+    mkdirSync(evidence, { recursive: true }); writeFileSync(join(evidence, 'report.txt'), 'PRIVATE_EXCLUDED_MARKER');
+    const path = join(item.destination, 'blocked');
+    await expect(createServiceBackup(item.source, path)).rejects.toMatchObject({ code: 'external-evidence' });
+    expect(existsSync(path)).toBe(false);
+    expect(readFileSync(join(evidence, 'report.txt'), 'utf8')).toBe('PRIVATE_EXCLUDED_MARKER');
   });
 
   it('coalesces requests, persists command deduplication, runs when due and rotates only verified owned copies', async () => {

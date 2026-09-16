@@ -304,6 +304,8 @@ async function createBackup(sourceDirectory: string, destinationDirectory: strin
       finally { identity.close(); }
     }
     if (workspaces.length > 500) throw new OperationsError('backup-limit');
+    // Evidence saved under a workspace is never captured below; block before any capture so its absence from the backup is never silent.
+    if (await externalEvidencePresent(source)) throw new OperationsError('external-evidence');
     const candidates: Candidate[] = snapshot?.candidates ?? [{ path: 'app.sqlite', kind: 'identity' }];
     if (!snapshot) {
       for (const kind of ['observation', 'telemetry'] as const) if (existsSync(join(source, `${kind}.sqlite`))) candidates.push({ path: `${kind}.sqlite`, kind });

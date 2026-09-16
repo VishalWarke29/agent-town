@@ -190,14 +190,13 @@ describe('offline recovery', () => {
     await expect(createOfflineBackup(third.source, third.backup)).rejects.toMatchObject({ code: 'unsupported-schema' });
   });
 
-  it('refuses junction destinations and explicitly counts excluded external evidence', async () => {
+  it('refuses junction destinations and blocks backups while external evidence is present', async () => {
     const item = fixture(), linked = join(item.root, 'linked');
     symlinkSync(item.source, linked, process.platform === 'win32' ? 'junction' : 'dir');
     expect(() => acquireDataDirectoryLock(linked)).toThrow('local directory');
     const evidence = join(item.source, 'workspaces', item.workspace.id, 'evidence'); mkdirSync(evidence); writeFileSync(join(evidence, 'report.txt'), 'External saved evidence');
-    const manifest = await createOfflineBackup(item.source, item.backup);
-    expect(manifest.coverage?.excluded.externalEvidence).toEqual({ items: 1, exact: true });
-    expect(existsSync(join(item.backup, 'workspaces', item.workspace.id, 'evidence'))).toBe(false);
+    await expect(createOfflineBackup(item.source, item.backup)).rejects.toMatchObject({ code: 'external-evidence' });
+    expect(existsSync(item.backup)).toBe(false);
     expect(readFileSync(join(evidence, 'report.txt'), 'utf8')).toBe('External saved evidence');
   });
 
