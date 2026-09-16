@@ -20,6 +20,7 @@
     "start": "node apps/service/dist/index.js",
     "check": "tsc --noEmit",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "test:e2e": "node scripts/test-browser.mjs",
     "doctor": "node scripts/doctor.mjs",
     "ops": "node apps/service/dist/ops.js"
@@ -33,6 +34,7 @@
     "@types/react-dom": "~19.2.0",
     "@types/three": "^0.183.0",
     "@vitejs/plugin-react": "^6.0.0",
+    "@vitest/coverage-v8": "^4.1.0",
     "concurrently": "^9.2.0",
     "esbuild": "0.28.2",
     "tsx": "^4.21.0",
