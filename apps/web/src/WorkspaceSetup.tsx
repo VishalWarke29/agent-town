@@ -1,11 +1,12 @@
 import { useState } from 'react';
-import { Check, ExternalLink, FolderGit2, Github, LoaderCircle, LogOut, Plus, ShieldCheck } from 'lucide-react';
+import { Check, ExternalLink, FolderGit2, Github, LoaderCircle, LogOut, Plus, ShieldCheck, Unplug } from 'lucide-react';
 import { DEMO_WORKSPACE } from '@agent-town/contracts';
 import type { IdentityController } from './useIdentity';
 
 export function WorkspaceSetup({ identity, available = identity.connection === 'connected' }: { identity: IdentityController; available?: boolean }) {
   const [name, setName] = useState('');
   const [kind, setKind] = useState<'personal' | 'company'>('personal');
+  const [confirmDisconnect, setConfirmDisconnect] = useState(false);
   const { session, flow, busy } = identity;
   if (identity.previewOnly) return <section className="workspace-setup" aria-label="Demo environment"><div className="feature-heading"><ShieldCheck size={25} /><h3>Demo environment</h3><p>This town uses fictional repositories, sessions, and reports. No accounts connect and no AI credits are used.</p></div><p>To set up your real workspace, stop the service and start it in development mode:</p><code className="repo-path">.\run.ps1 -Mode development</code></section>;
   return <section className="workspace-setup" aria-label="Private workspace setup">
@@ -35,6 +36,16 @@ export function WorkspaceSetup({ identity, available = identity.connection === '
     </div>}
     {session?.user && <>
       <div className="signed-in"><Github size={18} /><div><strong>{session.user.displayName ?? session.user.login}</strong><small>@{session.user.login}</small></div><button className="icon-button" aria-label="Sign out of GitHub" title="Sign out of GitHub" disabled={busy} onClick={() => void identity.logout()}><LogOut size={17} /></button></div>
+      <div className="setup-help">
+        <p className="muted small">Signing out only closes this browser session. To permanently remove the GitHub credential stored by this app, disconnect it below — you will need to re-authorize via GitHub afterward.</p>
+        {!confirmDisconnect
+          ? <button className="text-button" disabled={busy} onClick={() => setConfirmDisconnect(true)}><Unplug size={14} />Disconnect GitHub</button>
+          : <div className="setup-actions">
+              <p className="form-error" role="alert">Permanently remove the stored GitHub credential? This cannot be undone from here; you will need to re-authorize via GitHub afterward.</p>
+              <button className="button" disabled={busy} onClick={() => { setConfirmDisconnect(false); void identity.disconnectGithub(); }}>{busy ? <LoaderCircle size={16} className="spin" /> : <Unplug size={16} />}Yes, permanently disconnect</button>
+              <button className="text-button" disabled={busy} onClick={() => setConfirmDisconnect(false)}>Cancel</button>
+            </div>}
+      </div>
       <h3 className="subheading">Your workspaces</h3>
       {session.workspaces.length === 0 && <p className="muted">Create a workspace to connect your repositories.</p>}
       <div className="workspace-options">{session.workspaces.map(workspace => <button key={workspace.id} className={`workspace-option ${identity.workspaceId === workspace.id ? 'selected' : ''}`} aria-pressed={identity.workspaceId === workspace.id} onClick={() => identity.chooseWorkspace(workspace.id)}><FolderGit2 size={17} /><span><strong>{workspace.name}</strong><small>{workspace.kind === 'company' ? 'Company' : 'Personal'} · private</small></span>{identity.workspaceId === workspace.id && <Check size={15} />}</button>)}</div>

@@ -188,13 +188,14 @@ export function useIdentity() {
   }, [flow, request, accept]);
 
   const chooseWorkspace = (id: string) => {
-    if (session?.applicationMode === 'demo' && id !== DEMO_WORKSPACE) return;
-    if (session?.applicationMode === 'production' && id === DEMO_WORKSPACE) return;
-    if (id !== DEMO_WORKSPACE && !session?.workspaces.some(workspace => workspace.id === id)) return;
+    const current = sessionRef.current;
+    if (current?.applicationMode === 'demo' && id !== DEMO_WORKSPACE) return;
+    if (current?.applicationMode === 'production' && id === DEMO_WORKSPACE) return;
+    if (id !== DEMO_WORKSPACE && !current?.workspaces.some(workspace => workspace.id === id)) return;
     setPreviewRequested(id === DEMO_WORKSPACE);
     setWorkspaceId(id);
-    if (session?.user && id !== DEMO_WORKSPACE) {
-      try { localStorage.setItem(`agent-town-workspace:${session.user.id}`, id); } catch { /* Preference only. */ }
+    if (current?.user && id !== DEMO_WORKSPACE) {
+      try { localStorage.setItem(`agent-town-workspace:${current.user.id}`, id); } catch { /* Preference only. */ }
     }
   };
 
@@ -236,11 +237,15 @@ export function useIdentity() {
       setPreviewRequested(false);
       accept(next); setNotice('Signed out. Private workspace details are closed.');
     }),
+    disconnectGithub: () => action(async () => {
+      const next = await request<BrowserSession>('/auth/github/disconnect');
+      accept(next); setNotice('GitHub credentials removed. Sign in with GitHub again to reconnect.');
+    }),
     createWorkspace: (name: string, kind: 'personal' | 'company') => action(async () => {
       const result = await request<{ workspace: WorkspaceSummary }>('/workspaces', { name, kind });
       setPreviewRequested(false);
       const next = await refreshSession();
-      if (next.workspaces.some(workspace => workspace.id === result.workspace.id)) setWorkspaceId(result.workspace.id);
+      if (next.workspaces.some(workspace => workspace.id === result.workspace.id)) chooseWorkspace(result.workspace.id);
     }),
   };
 }
