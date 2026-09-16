@@ -23,6 +23,7 @@ export function registerObservationApi(app: FastifyInstance, dependencies: Depen
   const registry = new ObservationRegistry(join(dependencies.directory, 'observation.sqlite'));
   const rate = new Map<string, { start: number; count: number }>();
   const unavailableWorkspaces = new Set<string>();
+  const blockedByWorkspaceFailure = new Set<string>();
   let active: Promise<void> | null = null;
   let closing = false;
   const prefix = '/api/v1/workspaces/:id/observation/connections';
@@ -140,12 +141,23 @@ export function registerObservationApi(app: FastifyInstance, dependencies: Depen
     for (const record of registry.all()) {
       if (closing) return;
       try {
-        await drainObservationSpool({ directory: dependencies.directory, spool: spoolPath(dependencies.directory, record.connection.id), record,
-          store: dependencies.workspace(record.ownerId, record.workspaceId), receive: events => receive(record, events), closing: () => closing });
+        const store = dependencies.workspace(record.ownerId, record.workspaceId);
         unavailableWorkspaces.delete(record.workspaceId);
+        // A workspace that just recovered first gets a durable blocked marker for the
+        // outage; normal delivery (which could immediately overwrite it with 'idle')
+        // resumes on the next cycle instead of within this same recovery tick.
+        if (blockedByWorkspaceFailure.delete(record.connection.id)) {
+          store.commit(`workspace-recovered:${randomUUID()}`, (state, now) => {
+            const source = state.observation?.connections.find(item => item.id === record.connection.id);
+            if (source && source.status !== 'revoked') source.delivery = { status: 'blocked', pendingEvents: null, lastAttemptAt: now, message: 'The workspace was briefly unavailable and observation delivery was paused. Retry follows automatically.' };
+            return 'observation.delivery';
+          });
+          continue;
+        }
+        await drainObservationSpool({ directory: dependencies.directory, spool: spoolPath(dependencies.directory, record.connection.id), record, store, receive: events => receive(record, events), closing: () => closing });
       } catch {
         if (!unavailableWorkspaces.has(record.workspaceId)) app.log.warn('Observation replay could not open a scoped workspace. Pending local files were retained.');
-        unavailableWorkspaces.add(record.workspaceId);
+        unavailableWorkspaces.add(record.workspaceId); blockedByWorkspaceFailure.add(record.connection.id);
       }
     }
   };

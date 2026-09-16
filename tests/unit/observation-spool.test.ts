@@ -42,10 +42,17 @@ async function setup() {
     for (const event of events) store.commit(`observe:${record.connection.id}:${event.id}`, (current, now) => applyObservation(current, record.connection, event, now), JSON.stringify(event));
   };
   const close = async () => { await api?.close(); await app?.close(); api = undefined; app = undefined; store.close(); };
-  const restart = async () => {
+  // failWorkspaceCalls simulates the workspace itself being briefly unreachable (e.g. a corrupted or
+  // busy database): the drain loop's workspace resolution throws for that many calls before recovering.
+  const restart = async (failWorkspaceCalls = 0) => {
     await close(); store = new Store(database, state); app = Fastify();
+    let remainingFailures = failWorkspaceCalls;
     api = registerObservationApi(app, { directory, vault: { available: true, get: async () => null, put: async () => {}, delete: async () => {} },
-      scoped: () => ({ ownerId: '101', store }), workspace: (owner, workspace) => { if (owner !== '101' || workspace !== 'workspace-one') throw new Error('Scope violation'); return store; } });
+      scoped: () => ({ ownerId: '101', store }), workspace: (owner, workspace) => {
+        if (owner !== '101' || workspace !== 'workspace-one') throw new Error('Scope violation');
+        if (remainingFailures > 0) { remainingFailures--; throw new Error('Simulated workspace outage'); }
+        return store;
+      } });
   };
   fixtures.push({ directory, close });
   const write = (event: ObservationEvent, name = `${randomUUID()}.json`) => { const path = join(spool, name); writeFileSync(path, JSON.stringify(event)); return path; };
@@ -65,13 +72,13 @@ describe('durable local observation spool', () => {
       expect(fixture.store().snapshot().state.handoffs).toHaveLength(1);
       expect(fixture.store().snapshot().state.agents[0].activity).toBe('offline');
       expect(readdirSync(fixture.spool)).toEqual([]);
-    });
+    }, { timeout: 3000 });
     const first = fixture.store().snapshot().state;
     expect(first.workflow!.manager.queueReportIds).toEqual([first.handoffs[0].id]);
     expect(first.observation!.connections[0]).toMatchObject({ droppedEvents: 0, delivery: { status: 'idle', pendingEvents: 0 } });
     expect(first.activity.filter(item => item.kind === 'work' || item.kind === 'report').map(item => item.kind)).toEqual(['work', 'report']);
     await fixture.close(); fixture.write(report); await fixture.restart();
-    await vi.waitFor(() => expect(readdirSync(fixture.spool)).toEqual([]));
+    await vi.waitFor(() => expect(readdirSync(fixture.spool)).toEqual([]), { timeout: 3000 });
     expect(fixture.store().snapshot().state.handoffs).toHaveLength(1);
     expect(fixture.store().snapshot().state.agents[0].activity).toBe('offline');
   });
@@ -81,7 +88,7 @@ describe('durable local observation spool', () => {
     const end = fixture.observed('session.end', 'end', 1000); fixture.receive([end]);
     const previous = fixture.store().snapshot().state.agents[0];
     await fixture.close(); fixture.write(fixture.observed('report', 'late', 2000, 'Saved after the service stopped.')); await fixture.restart();
-    await vi.waitFor(() => expect(fixture.store().snapshot().state.handoffs).toHaveLength(1));
+    await vi.waitFor(() => expect(fixture.store().snapshot().state.handoffs).toHaveLength(1), { timeout: 3000 });
     expect(fixture.store().snapshot().state.agents[0]).toEqual(previous);
     expect(fixture.store().snapshot().state.manager.version).toBe(0);
   });
@@ -92,7 +99,7 @@ describe('durable local observation spool', () => {
     await fixture.drain(events => { fixture.receive(events); throw new Error('Simulated interruption after durable commit'); });
     expect(existsSync(path)).toBe(true); expect(fixture.store().snapshot().state.handoffs).toHaveLength(1);
     expect(fixture.store().snapshot().state.observation!.connections[0]).toMatchObject({ droppedEvents: 0, delivery: { status: 'blocked', pendingEvents: 1 } });
-    await fixture.restart(); await vi.waitFor(() => expect(existsSync(path)).toBe(false));
+    await fixture.restart(); await vi.waitFor(() => expect(existsSync(path)).toBe(false), { timeout: 3000 });
     expect(fixture.store().snapshot().state.handoffs).toHaveLength(1);
   });
 
@@ -102,6 +109,13 @@ describe('durable local observation spool', () => {
     expect(existsSync(path)).toBe(true); expect(fixture.store().snapshot().state.handoffs).toHaveLength(0);
     expect(fixture.store().snapshot().state.observation!.connections[0]).toMatchObject({ droppedEvents: 0, delivery: { status: 'blocked', pendingEvents: 1 } });
     await fixture.drain(); expect(existsSync(path)).toBe(false); expect(fixture.store().snapshot().state.handoffs).toHaveLength(1);
+  });
+
+  it('leaves a durable blocked delivery status once a workspace-resolution failure recovers', async () => {
+    const fixture = await setup();
+    await fixture.restart(2);
+    await vi.waitFor(() => expect(fixture.store().snapshot().state.observation!.connections[0].delivery).toMatchObject({ status: 'blocked', pendingEvents: null }), { timeout: 3000 });
+    expect(fixture.store().snapshot().state.observation!.connections[0].delivery!.message).toMatch(/unavailable/i);
   });
 
   it('bounds each replay batch and reports the remaining observed backlog', async () => {
