@@ -79,7 +79,7 @@ describe('local service boundaries', () => {
   it('rejects invalid stream cursors and oversized bodies without mutating state', async () => {
     const bad = await instance.app.inject({ url: `${base}/events?after=-1`, headers: headers() });
     expect(bad.statusCode).toBe(400);
-    const large = await instance.app.inject({ method: 'POST', url: `${base}/demo/commands`, headers: headers(), payload: { action: 'play', garbage: 'a'.repeat(17000) } });
+    const large = await instance.app.inject({ method: 'POST', url: `${base}/demo/commands`, headers: headers(), payload: { action: 'play', garbage: 'a'.repeat(1024 * 1024 + 1) } });
     expect(large.statusCode).toBe(413);
     expect(instance.store.snapshot().cursor).toBe(0);
   });

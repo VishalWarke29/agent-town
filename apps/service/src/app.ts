@@ -49,7 +49,7 @@ export async function createApp(options: Options) {
     return identity.registry.requireWorkspace(owner, id);
   });
   const store = new Store(options.database);
-  const app = Fastify({ logger: options.logger ? { level: 'info', redact: ['req.headers', 'res.headers'] } : false, logController: new LogController({ disableRequestLogging: true }), bodyLimit: 16 * 1024, requestTimeout: 15000 });
+  const app = Fastify({ logger: options.logger ? { level: 'info', redact: ['req.headers', 'res.headers'] } : false, logController: new LogController({ disableRequestLogging: true }), bodyLimit: 1024 * 1024, requestTimeout: 15000 });
   await app.register(cookie);
 
   const sessionFor = (request: FastifyRequest) => sessions.get(request.cookies[COOKIE] ?? '');
@@ -162,6 +162,14 @@ export async function createApp(options: Options) {
     invalidate(request.cookies[COOKIE]!);
     return issueSession(reply);
   });
+  // Distinct from logout: this removes the stored GitHub credential itself
+  // (the vault entry and its registry reference), not just the browser
+  // session. The browser session is left untouched.
+  app.post('/api/v1/auth/github/disconnect', async request => {
+    const owner = requireOwner(request);
+    await identity!.disconnect(owner);
+    return { ok: true };
+  });
   app.get('/api/v1/workspaces', async request => {
     const owner = requireOwner(request);
     return { workspaces: identity!.registry.listWorkspaces(owner).map(({ id, name, kind }) => ({ id, name, kind })) };
@@ -250,7 +258,9 @@ export async function createApp(options: Options) {
     const result = scopedStore(request);
     if (result.snapshot().state.workspace.mode !== 'private') throw new IdentityError('PRIVATE_WORKSPACE_REQUIRED', 'Select a private workspace first.', 400);
     return result;
-  }, listGitHub: request => identity!.listRepositories(requireOwner(request)), stores: () => identity?.registry.listAllWorkspaces().map(workspace => privateStores.get(workspace.ownerId, workspace.id)) ?? [] });
+  }, listGitHub: request => identity!.listRepositories(requireOwner(request)),
+  listGitHubBackground: store => identity!.listRepositories(identity!.registry.listAllWorkspaces().find(workspace => workspace.id === store.snapshot().state.workspace.id)!.ownerId),
+  stores: () => identity?.registry.listAllWorkspaces().map(workspace => privateStores.get(workspace.ownerId, workspace.id)) ?? [] });
 
   const observation = identity && options.privateDirectory ? registerObservationApi(app, {
     directory: options.privateDirectory, vault: options.vault ?? new WindowsDpapiVault(),
