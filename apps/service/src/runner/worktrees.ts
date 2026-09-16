@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { lstat, mkdir, realpath, opendir, readFile } from 'node:fs/promises';
+import { lstat, mkdir, realpath, opendir, readdir, readFile, rm } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { dirname, isAbsolute, resolve, join } from 'node:path';
 import { hasCurrentSourceFingerprint, type Repository, type WorktreeEvidence } from '@agent-town/contracts';
@@ -14,6 +14,32 @@ import { requireRuntimeSeparation } from './sandbox-boundary.js';
 
 const execute = promisify(execFile);
 const nullFile = process.platform === 'win32' ? 'NUL' : '/dev/null';
+// Nothing ever reclaims a run's Git worktree, so disk use grows without bound.
+// Bound it the same way BackupScheduler bounds backups (ops/scheduler.ts): an
+// age window and a retained-count cap, whichever an entry reaches first.
+const WORKTREE_RETENTION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // Matches BackupScheduler's default 7-day backup retention.
+const MAX_RETAINED_WORKTREES = 200; // Matches RETAINED_AGENT_LIMIT, this workspace's retained run/agent cap.
+const MIN_WORKTREE_PRUNE_AGE_MS = 60 * 60 * 1000; // A run's maxMinutes is capped at 15; a 4x margin before anything is ever a prune candidate.
+
+/** Best-effort, race-free reclamation. A run cannot last past its 15-minute
+ * maxMinutes cap, so nothing newer than the safety margin above is ever a
+ * candidate; only then does the age/count retention below apply. */
+async function pruneManagedWorktrees(root: string): Promise<void> {
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  const now = Date.now(), candidates: { name: string; age: number }[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    try { const info = await lstat(await checkedPath(join(root, entry.name), [root])); if (info.isDirectory()) candidates.push({ name: entry.name, age: now - info.mtimeMs }); }
+    catch { /* Ignore an unsafe or already-changing entry; retried next time. */ }
+  }
+  candidates.sort((a, b) => b.age - a.age);
+  const excess = Math.max(0, candidates.length - MAX_RETAINED_WORKTREES);
+  for (const [index, candidate] of candidates.entries()) {
+    if (candidate.age < MIN_WORKTREE_PRUNE_AGE_MS || (index >= excess && candidate.age <= WORKTREE_RETENTION_WINDOW_MS)) continue;
+    try { await rm(await checkedPath(join(root, candidate.name), [root]), { recursive: true }); }
+    catch { /* Best-effort; retried next time. */ }
+  }
+}
 async function git(repo: string, arguments_: string[], gitDirectory?: string, excludedRoots: string[] = [repo]): Promise<string> {
   const executable = await resolveExecutable('git', excludedRoots);
   if (!executable) throw new WorkflowError('git_missing', 'Git is required for managed worktrees.', 503);
@@ -41,6 +67,7 @@ export async function createManagedWorktree(repo: string, baseCommit: string, da
   const root = resolve(dataDirectory, 'worktrees');
   await mkdir(root, { recursive: true, mode: 0o700 });
   await checkedPath(root, [resolve(dataDirectory)]);
+  void pruneManagedWorktrees(root).catch(() => undefined); // Opportunistic, never blocks starting this run.
   const path = resolve(root, runId);
   if (!isWithin(root, path) || path === root) throw new WorkflowError('worktree_path_invalid', 'Invalid managed worktree path.');
   try { await lstat(path); throw new WorkflowError('worktree_exists', 'This run already has a worktree. It will not be overwritten.'); }

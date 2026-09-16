@@ -78,7 +78,11 @@ export class NativeRunExecutor implements RunExecutor {
       finally { releaseSourceTree(source); }
     }
   }
-  private async executeSource(input: ExecutionInput): Promise<ExecutionResult> {
+  // Not private: tests/unit/runner.test.ts exercises the Codex subscription-turn
+  // logic directly, bypassing the execute() guard above (native Codex is blocked
+  // pending an external tool capability). No runtime behavior depends on this
+  // visibility; execute() is still the only caller reachable from the service.
+  async executeSource(input: ExecutionInput): Promise<ExecutionResult> {
     const home = join(this.dataDirectory, 'codex', input.draft.connectionId);
     const rpc = await startCodex(home, input.draft.mode === 'subscription' ? 'subscription' : 'sandbox');
     try {
@@ -143,6 +147,7 @@ export class NativeRunExecutor implements RunExecutor {
             const value = z.discriminatedUnion('type', [z.object({ type: z.literal('ready'), pid: z.number().int().min(2).max(4_194_304) }), z.object({ type: z.literal('context-delivered'), model: z.literal(input.draft.model) }), z.object({ type: z.literal('error'), message: z.string().max(1000) }), z.object({ type: z.literal('result'), model: z.literal(input.draft.model), outcome: z.enum(['review', 'failed', 'cancelled']), summary: z.string().max(8000), providerRequests: z.number().int().nonnegative().max(input.draft.maxTurns), usage: z.object({ inputTokens: count, outputTokens: count, cachedInputTokens: count, cacheWriteTokens: count, reasoningTokens: count.nullable(), source: z.literal('provider-reported') }).nullable() })]).parse(JSON.parse(line));
             if (value.type === 'ready') { if (pid !== null) throw new Error(); pid = value.pid; if (cancelling || input.signal.aborted) cancel(); }
             if (value.type === 'context-delivered') input.onContextDelivered();
+            if (value.type === 'error') result = { outcome: 'failed', summary: value.message, usage: null, providerRequests: 0 };
             if (value.type === 'result') result = value;
           } catch { cancel(); }
         }

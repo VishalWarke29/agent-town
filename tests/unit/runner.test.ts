@@ -13,9 +13,19 @@ import { RunnerService, NativeRunExecutor, type RunExecutor, type ExecutionInput
 import { BoundedOpenAIWorker } from '../../apps/service/src/runner/openai-worker';
 import { BoundedAnthropicWorker } from '../../apps/service/src/runner/anthropic-worker';
 import { checkedWorktreeFile, sourceFingerprint } from '../../apps/service/src/runner/worktrees';
-import { minimalEnvironment } from '../../apps/service/src/runner/rpc';
+import { minimalEnvironment, startCodex } from '../../apps/service/src/runner/rpc';
 import { executeWorkerTool } from '../../apps/service/src/runner/api-tools';
 import { prepareSourceTree, releaseSourceTree } from '../../apps/service/src/runner/source-tree';
+import { accountFingerprint } from '../../apps/service/src/runner/native';
+
+vi.mock('../../apps/service/src/runner/rpc', async importOriginal => {
+  const actual = await importOriginal<typeof import('../../apps/service/src/runner/rpc')>();
+  return { ...actual, startCodex: vi.fn() };
+});
+vi.mock('../../apps/service/src/runner/sandbox-probes', async importOriginal => {
+  const actual = await importOriginal<typeof import('../../apps/service/src/runner/sandbox-probes')>();
+  return { ...actual, verifySandboxBoundary: vi.fn(async () => undefined) };
+});
 
 const execute = promisify(execFile);
 const key = 'sk-fixture_runner_credential_never_real';
@@ -418,6 +428,28 @@ describe('managed run authorization and durable lifecycle', { timeout: 30000 }, 
 function rpcFixture(): RpcTransport {
   return { request: vi.fn(async () => ({ exitCode: 0, stdout: 'tool result', stderr: '' })), notify: vi.fn(), subscribe: vi.fn(() => () => undefined), close: vi.fn() };
 }
+function codexDraftFixture(overrides: Partial<CreateRunDraft> = {}): CreateRunDraft {
+  return { dependencyTaskIds: [], repoId: 'repo', tool: 'codex', connectionId: 'codex-fixture', mode: 'subscription', objective: 'Update the source value.', acceptanceCriteria: ['Change only the source value.'], model: 'fixture-model', price: null, maxTurns: 1, maxOutputTokens: 500, maxMinutes: 1, budgetMicroUsd: 0, acknowledgeSubscriptionLimits: true, ...overrides };
+}
+function codexInputFixture(worktree: string, signal: AbortSignal, fingerprint: string | null): ExecutionInput {
+  return { runId: 'run-fixture', worktree, draft: codexDraftFixture(), contextVersion: 1, contextBrief: 'Preserve tests.', connection: null, apiKey: null, accountFingerprint: fingerprint, signal, onContextDelivered: vi.fn(), onRequestStart: vi.fn(() => 'reservation'), onRequestComplete: vi.fn(), onRequestRejected: vi.fn() };
+}
+/** A fixture RPC that answers the isolated native Codex account/thread/turn calls
+ * executeSource makes, and exposes its subscribed event listener so a test can
+ * emit item/turn events the same way the real native process would. */
+function codexRpcFixture(account: { type: 'chatgpt'; email: string; planType: string }) {
+  let listener: (method: string, data: unknown) => void = () => undefined;
+  const rpc = rpcFixture();
+  rpc.subscribe = vi.fn(value => { listener = value; return () => undefined; });
+  rpc.request = vi.fn(async (method: string) => {
+    if (method === 'windowsSandbox/readiness') return { status: 'ready' };
+    if (method === 'account/read') return { account };
+    if (method === 'thread/start') return { thread: { id: 'thread-fixture' } };
+    if (method === 'turn/start') return { turn: { id: 'turn-fixture' } };
+    return {};
+  });
+  return { rpc, emit: (method: string, data: unknown) => listener(method, data) };
+}
 function inputFixture(draft: CreateRunDraft, worktree: string, provider: 'openai' | 'anthropic' = 'openai'): ExecutionInput {
   draft = { ...draft, model: provider === 'anthropic' ? 'claude-haiku-4-5-20251001' : 'gpt-5.4-mini-2026-03-17', price: draft.price ? { ...draft.price, model: provider === 'anthropic' ? 'claude-haiku-4-5-20251001' : 'gpt-5.4-mini-2026-03-17' } : null };
   return { runId: 'run-fixture', worktree, draft, contextVersion: 1, contextBrief: 'Preserve tests.', connection: { id: 'fixture', provider, mode: 'api', label: 'fixture', status: 'verified', createdAt: '', verifiedAt: '', accountIdentity: 'unavailable', models: ['fixture-model'], capabilities: { manager: true, managedExecution: true } }, apiKey: key, accountFingerprint: null, signal: new AbortController().signal, onContextDelivered: vi.fn(), onRequestStart: vi.fn(() => 'reservation'), onRequestComplete: vi.fn(), onRequestRejected: vi.fn() };
@@ -467,5 +499,50 @@ describe('bounded provider and sandbox boundaries', () => {
     expect(minimalEnvironment()).not.toHaveProperty('OPENAI_API_KEY'); expect(minimalEnvironment()).not.toHaveProperty('ANTHROPIC_API_KEY'); expect(minimalEnvironment()).not.toHaveProperty('CLAUDE_CONFIG_DIR');
     const result = await new NativeRunExecutor(join(directory, 'native')).preflight('claude');
     expect(result.ready).toBe(false); expect(result.checks.find(value => value.name === 'SDK budget enforcement')?.passed).toBe(false);
+  });
+});
+
+// execute() unconditionally blocks the codex tool pending an external capability
+// (see native.ts), so these call executeSource directly to cover its otherwise
+// untested subscription-turn logic: account fingerprint check, thread/turn start,
+// cancellation via turn interrupt, and completion reporting.
+describe('native Codex subscription-turn execution (executeSource, bypassing the outer codex-tool guard)', () => {
+  const account = { type: 'chatgpt' as const, email: 'fixture@example.test', planType: 'plus' };
+  it('completes a subscription turn reported by the isolated native worker events', async () => {
+    const { directory, repo } = await setup();
+    const { rpc, emit } = codexRpcFixture(account);
+    vi.mocked(startCodex).mockReset().mockResolvedValue(rpc);
+    const executor = new NativeRunExecutor(join(directory, 'native-codex'));
+    const input = codexInputFixture(repo, new AbortController().signal, accountFingerprint(account));
+    const resultPromise = executor.executeSource(input);
+    await vi.waitFor(() => expect(input.onContextDelivered).toHaveBeenCalledOnce());
+    emit('item/completed', { threadId: 'thread-fixture', item: { type: 'agentMessage', text: 'All done.' } });
+    emit('turn/completed', { threadId: 'thread-fixture', turn: { id: 'turn-fixture', status: 'completed' } });
+    expect(await resultPromise).toEqual({ outcome: 'review', summary: 'All done.', usage: null, providerRequests: null });
+    expect(rpc.close).toHaveBeenCalledOnce();
+  });
+  it('interrupts the active turn and reports cancellation when the run is aborted mid-turn', async () => {
+    const { directory, repo } = await setup();
+    const { rpc } = codexRpcFixture(account);
+    vi.mocked(startCodex).mockReset().mockResolvedValue(rpc);
+    const executor = new NativeRunExecutor(join(directory, 'native-codex'));
+    const controller = new AbortController();
+    const input = codexInputFixture(repo, controller.signal, accountFingerprint(account));
+    const resultPromise = executor.executeSource(input);
+    await vi.waitFor(() => expect(input.onContextDelivered).toHaveBeenCalledOnce());
+    controller.abort();
+    expect(await resultPromise).toEqual({ outcome: 'cancelled', summary: 'Cancellation requested. Review retained changes and native allowance.', usage: null, providerRequests: null });
+    expect(rpc.request).toHaveBeenCalledWith('turn/interrupt', { threadId: 'thread-fixture', turnId: 'turn-fixture' });
+  });
+  it('rejects a changed isolated Codex account before starting any thread or turn', async () => {
+    const { directory, repo } = await setup();
+    const { rpc } = codexRpcFixture(account);
+    vi.mocked(startCodex).mockReset().mockResolvedValue(rpc);
+    const executor = new NativeRunExecutor(join(directory, 'native-codex'));
+    const input = codexInputFixture(repo, new AbortController().signal, 'mismatched-fingerprint');
+    await expect(executor.executeSource(input)).rejects.toMatchObject({ code: 'codex_account_changed' });
+    expect(rpc.request).not.toHaveBeenCalledWith('thread/start', expect.anything());
+    expect(rpc.request).not.toHaveBeenCalledWith('turn/start', expect.anything());
+    expect(rpc.close).toHaveBeenCalledOnce();
   });
 });

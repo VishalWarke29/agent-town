@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, opendir, rename, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, opendir, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { checkedPath, isWithin } from '../discovery/paths.js';
@@ -11,6 +11,13 @@ const privateDirectories = new Set(['.git', '.hg', '.svn', '.codex', '.claude', 
 const privateFiles = new Set(['.npmrc', '.pypirc', '.netrc', '_netrc', '.gitconfig', '.git-credentials']);
 const digest = (value: Uint8Array) => createHash('sha256').update(value).digest('hex');
 const maxFileBytes = 8_000_000, maxTreeBytes = 64_000_000, maxEntries = 20_000;
+// Nothing ever reclaims a run's execution source copy, so disk use grows without
+// bound. Bound it the same way BackupScheduler bounds backups (ops/scheduler.ts,
+// worktrees.ts's own pruneManagedWorktrees): an age window and a retained-count
+// cap, whichever an entry reaches first.
+const EXECUTION_TREE_RETENTION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // Matches BackupScheduler's default 7-day backup retention.
+const MAX_RETAINED_EXECUTION_TREES = 200; // Matches RETAINED_AGENT_LIMIT, this workspace's retained run/agent cap.
+const MIN_EXECUTION_TREE_PRUNE_AGE_MS = 60 * 60 * 1000; // A run's maxMinutes is capped at 15; a 4x margin before anything is ever a prune candidate.
 
 /** Shared source policy. It cannot identify secrets disguised as ordinary source. */
 export function protectedSourcePath(value: string): boolean {
@@ -68,6 +75,27 @@ async function sourceFiles(root: string): Promise<{ files: Map<string, SourceFil
   return { files, excludedEntries };
 }
 
+/** Best-effort, race-free reclamation, mirroring pruneManagedWorktrees in
+ * worktrees.ts. A run cannot last past its 15-minute maxMinutes cap, so nothing
+ * newer than the safety margin below is ever a candidate; a currently prepared
+ * tree is also never touched regardless of age. */
+async function pruneExecutionTrees(root: string): Promise<void> {
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  const now = Date.now(), candidates: { name: string; age: number }[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || sourceRoots.has(join(root, entry.name, 'source'))) continue;
+    try { const info = await lstat(await checkedPath(join(root, entry.name), [root])); if (info.isDirectory()) candidates.push({ name: entry.name, age: now - info.mtimeMs }); }
+    catch { /* Ignore an unsafe or already-changing entry; retried next time. */ }
+  }
+  candidates.sort((a, b) => b.age - a.age);
+  const excess = Math.max(0, candidates.length - MAX_RETAINED_EXECUTION_TREES);
+  for (const [index, candidate] of candidates.entries()) {
+    if (candidate.age < MIN_EXECUTION_TREE_PRUNE_AGE_MS || (index >= excess && candidate.age <= EXECUTION_TREE_RETENTION_WINDOW_MS)) continue;
+    try { await rm(await checkedPath(join(root, candidate.name), [root]), { recursive: true }); }
+    catch { /* Best-effort; retried next time. */ }
+  }
+}
+
 /** The agent receives no Git pointer, object database, private configuration or dependency cache. */
 export async function prepareSourceTree(worktree: string, dataDirectory: string, runId: string): Promise<PreparedSourceTree> {
   if (!/^[A-Za-z0-9-]{1,80}$/u.test(runId)) throw new WorkflowError('source_tree_invalid', 'Invalid execution tree identifier.');
@@ -76,6 +104,7 @@ export async function prepareSourceTree(worktree: string, dataDirectory: string,
   const root = resolve(dataDirectory, 'execution');
   await mkdir(root, { recursive: true, mode: 0o700 });
   await checkedPath(root, [resolve(dataDirectory)]);
+  void pruneExecutionTrees(root).catch(() => undefined); // Opportunistic, never blocks starting this run.
   const path = resolve(root, runId, 'source');
   if (!isWithin(root, path) || isWithin(original, path) || isWithin(path, original)) throw new WorkflowError('source_tree_invalid', 'Source and retained worktree boundaries must be separate.');
   const snapshot = await sourceFiles(original);
