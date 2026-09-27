@@ -70,6 +70,33 @@ export function roomCameraPose(point: [number, number], viewport: CameraViewport
       : mobile ? { top: Math.min(235, viewport.height * 0.28), bottom: Math.min(155, viewport.height * 0.2), left: 24, right: 24 } : { top: Math.min(170, viewport.height * 0.28), bottom: Math.min(100, viewport.height * 0.2), left: 95, right: 35 });
 }
 
+/** Frames the Archive's floating 3D visualization (a solar system or constellation) as close to
+ * full-screen as this world's fixed-tilt orthographic camera allows: a box centered on where it
+ * floats, generously sized to its footprint, with only the topbar and the still-open right-side
+ * details drawer reserved. Unlike roomCameraPose (sized and positioned for a ground-level repository
+ * house), this box sits at the visualization's own elevation, not the ground. */
+// Steeper than DEFAULT_CAMERA_OFFSET (more overhead, less oblique) specifically for the Archive: at
+// the town's normal isometric tilt, a nearby ground-level building can sit almost directly along the
+// camera's viewing/depth axis from wherever the Archive happens to stand — a horizontal-only
+// separation (raw X/Z distance) does not prevent that, as an oblique view compresses depth far more
+// than a steep one. Looking down more steeply keeps whichever building is nearby low in the frame
+// instead of centered in it, without needing the Archive to sit somewhere with no neighbor at all —
+// the owner's own placement, not a placement chosen to dodge this, is what's preserved this way.
+// Symmetric in X/Z on purpose: it should help regardless of which side a building happens to be on.
+const ARCHIVE_CAMERA_OFFSET: CameraPoint = [11, 40, 11];
+
+export function archiveCameraPose(point: [number, number], elevation: number, radius: number, viewport: CameraViewport): CameraPose {
+  const mobile = viewport.width < 900;
+  const rightPanel = mobile ? 0 : Math.min(460, viewport.width * 0.34);
+  return fitOrthographicBounds(
+    { min: [point[0] - radius, elevation - 0.8, point[1] - radius], max: [point[0] + radius, elevation + 2.6, point[1] + radius] },
+    viewport,
+    mobile ? { top: Math.min(230, viewport.height * 0.26), bottom: Math.min(150, viewport.height * 0.2), left: 20, right: 20 }
+      : { top: 78, bottom: 24, left: 90, right: rightPanel + 24 },
+    ARCHIVE_CAMERA_OFFSET,
+  );
+}
+
 /** Preserve the same relative scale when restoring an overview in a resized viewport. */
 export function resizeCameraPose(pose: CameraPose, before: CameraViewport, after: CameraViewport): CameraPose {
   const scaleBefore = Math.min(before.width / 36, before.height / 27);

@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join, relative, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import Fastify from 'fastify';
-import type { ObservationEvent } from '@agent-town/contracts';
+import { SERVICE_CAPABILITIES_FILE, type ObservationEvent } from '@agent-town/contracts';
 import { privateState } from '../../apps/service/src/workspaces';
 import { Store, projectRoot } from '../../apps/service/src/store';
 import { ObservationRegistry, type RegisteredObservation } from '../../apps/service/src/observation/registry';
@@ -16,6 +16,10 @@ import { bridgeConfigPath, spoolPath, writeBridgeConfig } from '../../apps/servi
 import { registerObservationApi } from '../../apps/service/src/observation/service';
 import { IdentityError } from '../../apps/service/src/identity';
 
+// How long a test waits for the service's background drain loop to reach the state it asserts before vi.waitFor gives up. The loop settles in well under a second on
+// a quiet machine, and needed more than the old 3 seconds when other agents or test runs kept the machine busy (MG-40 follow-up, 2026-09-24). vi.waitFor returns the moment
+// the condition holds, so a passing run is no slower, and the condition (every expect inside it) is unchanged: only the time allowed before failing is longer.
+const SETTLE = { timeout: 15_000 };
 const fixtures: { directory: string; close(): Promise<void> }[] = [];
 afterEach(async () => {
   for (const fixture of fixtures.splice(0)) {
@@ -25,6 +29,9 @@ afterEach(async () => {
     rmSync(target, { recursive: true, force: true });
   }
 });
+/** Every connection's spool now permanently carries its capability file (WS3-23) alongside whatever
+ * event files a test wrote itself; assertions about the spool's own event contents read through it. */
+function spoolEntries(spool: string) { return readdirSync(spool).filter(name => name !== SERVICE_CAPABILITIES_FILE); }
 async function setup() {
   const directory = mkdtempSync(join(tmpdir(), 'agent-town-spool-')), root = join(directory, 'repo'); mkdirSync(root);
   const state = privateState({ id: 'workspace-one', name: 'Fixture', kind: 'personal' });
@@ -71,14 +78,14 @@ describe('durable local observation spool', () => {
     await vi.waitFor(() => {
       expect(fixture.store().snapshot().state.handoffs).toHaveLength(1);
       expect(fixture.store().snapshot().state.agents[0].activity).toBe('offline');
-      expect(readdirSync(fixture.spool)).toEqual([]);
-    }, { timeout: 3000 });
+      expect(spoolEntries(fixture.spool)).toEqual([]);
+    }, SETTLE);
     const first = fixture.store().snapshot().state;
     expect(first.workflow!.manager.queueReportIds).toEqual([first.handoffs[0].id]);
     expect(first.observation!.connections[0]).toMatchObject({ droppedEvents: 0, delivery: { status: 'idle', pendingEvents: 0 } });
     expect(first.activity.filter(item => item.kind === 'work' || item.kind === 'report').map(item => item.kind)).toEqual(['work', 'report']);
     await fixture.close(); fixture.write(report); await fixture.restart();
-    await vi.waitFor(() => expect(readdirSync(fixture.spool)).toEqual([]), { timeout: 3000 });
+    await vi.waitFor(() => expect(spoolEntries(fixture.spool)).toEqual([]), SETTLE);
     expect(fixture.store().snapshot().state.handoffs).toHaveLength(1);
     expect(fixture.store().snapshot().state.agents[0].activity).toBe('offline');
   });
@@ -88,7 +95,7 @@ describe('durable local observation spool', () => {
     const end = fixture.observed('session.end', 'end', 1000); fixture.receive([end]);
     const previous = fixture.store().snapshot().state.agents[0];
     await fixture.close(); fixture.write(fixture.observed('report', 'late', 2000, 'Saved after the service stopped.')); await fixture.restart();
-    await vi.waitFor(() => expect(fixture.store().snapshot().state.handoffs).toHaveLength(1), { timeout: 3000 });
+    await vi.waitFor(() => expect(fixture.store().snapshot().state.handoffs).toHaveLength(1), SETTLE);
     expect(fixture.store().snapshot().state.agents[0]).toEqual(previous);
     expect(fixture.store().snapshot().state.manager.version).toBe(0);
   });
@@ -99,7 +106,7 @@ describe('durable local observation spool', () => {
     await fixture.drain(events => { fixture.receive(events); throw new Error('Simulated interruption after durable commit'); });
     expect(existsSync(path)).toBe(true); expect(fixture.store().snapshot().state.handoffs).toHaveLength(1);
     expect(fixture.store().snapshot().state.observation!.connections[0]).toMatchObject({ droppedEvents: 0, delivery: { status: 'blocked', pendingEvents: 1 } });
-    await fixture.restart(); await vi.waitFor(() => expect(existsSync(path)).toBe(false), { timeout: 3000 });
+    await fixture.restart(); await vi.waitFor(() => expect(existsSync(path)).toBe(false), SETTLE);
     expect(fixture.store().snapshot().state.handoffs).toHaveLength(1);
   });
 
@@ -114,17 +121,21 @@ describe('durable local observation spool', () => {
   it('leaves a durable blocked delivery status once a workspace-resolution failure recovers', async () => {
     const fixture = await setup();
     await fixture.restart(2);
-    await vi.waitFor(() => expect(fixture.store().snapshot().state.observation!.connections[0].delivery).toMatchObject({ status: 'blocked', pendingEvents: null }), { timeout: 3000 });
+    await vi.waitFor(() => expect(fixture.store().snapshot().state.observation!.connections[0].delivery).toMatchObject({ status: 'blocked', pendingEvents: null }), SETTLE);
     expect(fixture.store().snapshot().state.observation!.connections[0].delivery!.message).toMatch(/unavailable/i);
   });
 
-  it('bounds each replay batch and reports the remaining observed backlog', async () => {
+  // The fixture has to be SPOOL_BATCH_LIMIT + 5 events (the batch limit is the thing under test) and each
+  // one is a separate saved commit, so it cannot be made smaller. It timed out at the default 10 seconds
+  // while other test runs kept the machine busy (MG-40, 2026-09-24) and takes about 1 second alone, so
+  // only the limit is raised, to 60 seconds. Every assertion is unchanged.
+  it('bounds each replay batch and reports the remaining observed backlog', { timeout: 60_000 }, async () => {
     const fixture = await setup();
     for (let index = 0; index < SPOOL_BATCH_LIMIT + 5; index++) fixture.write(fixture.observed('tool.finish', `tool-${index}`));
     await fixture.drain();
-    expect(readdirSync(fixture.spool)).toHaveLength(5);
+    expect(spoolEntries(fixture.spool)).toHaveLength(5);
     expect(fixture.store().snapshot().state.observation!.connections[0].delivery).toMatchObject({ status: 'pending', pendingEvents: 5 });
-    await fixture.drain(); expect(readdirSync(fixture.spool)).toHaveLength(0);
+    await fixture.drain(); expect(spoolEntries(fixture.spool)).toHaveLength(0);
   });
 
   it('durably counts rejected records and labels coalesced overflow as an unknown lower bound', async () => {
@@ -137,7 +148,7 @@ describe('durable local observation spool', () => {
     const state = fixture.store().snapshot().state;
     expect(state.observation!.connections[0]).toMatchObject({ droppedEvents: 4, droppedEventsExact: false, delivery: { status: 'idle', pendingEvents: 0 } });
     expect(state.activity.filter(item => item.message.startsWith('Observation coverage gap:'))).toHaveLength(4);
-    expect(JSON.stringify(state)).not.toContain('never-display'); expect(readdirSync(fixture.spool)).toHaveLength(0);
+    expect(JSON.stringify(state)).not.toContain('never-display'); expect(spoolEntries(fixture.spool)).toHaveLength(0);
   });
 
   it('retains unfinished write evidence and never labels an unreadable pending count as zero', async () => {
@@ -147,7 +158,7 @@ describe('durable local observation spool', () => {
     await fixture.drain();
     expect(fixture.store().snapshot().state.handoffs).toHaveLength(1);
     expect(fixture.store().snapshot().state.observation!.connections[0]).toMatchObject({ droppedEvents: 0, delivery: { status: 'blocked', pendingEvents: null } });
-    expect(readdirSync(fixture.spool)).toEqual([temporary]);
+    expect(spoolEntries(fixture.spool)).toEqual([temporary]);
   });
 
   it('retains a loss claim across replay without counting its acknowledged loss twice', async () => {
@@ -156,7 +167,7 @@ describe('durable local observation spool', () => {
     expect(fixture.store().snapshot().state.observation!.connections[0].droppedEvents).toBe(1);
     writeFileSync(join(fixture.spool, name), '1'); await fixture.drain();
     expect(fixture.store().snapshot().state.observation!.connections[0].droppedEvents).toBe(1);
-    expect(readdirSync(fixture.spool)).toEqual([]);
+    expect(spoolEntries(fixture.spool)).toEqual([]);
   });
 
   it('rejects out-of-window events with an explicit durable coverage gap', async () => {
@@ -172,11 +183,57 @@ describe('durable local observation spool', () => {
     const linkedName = `${randomUUID()}.json`; linkSync(protectedFile, join(fixture.spool, linkedName));
     await fixture.drain(); expect(existsSync(join(fixture.spool, linkedName))).toBe(false);
     expect(readFileSync(protectedFile, 'utf8')).toBe('PRIVATE_SENTINEL');
-    rmdirSync(fixture.spool); symlinkSync(outside, fixture.spool, process.platform === 'win32' ? 'junction' : 'dir');
+    rmSync(fixture.spool, { recursive: true }); symlinkSync(outside, fixture.spool, process.platform === 'win32' ? 'junction' : 'dir');
     await fixture.drain();
     expect(fixture.store().snapshot().state.observation!.connections[0].delivery).toMatchObject({ status: 'blocked', pendingEvents: null });
     expect(JSON.stringify(fixture.store().snapshot())).not.toContain('PRIVATE_SENTINEL');
     expect(readFileSync(protectedFile, 'utf8')).toBe('PRIVATE_SENTINEL');
+  });
+
+  it('quarantines a well-formed but unrecognized-kind event in newer/ instead of deleting it, and re-drains it once a later build understands it', async () => {
+    const fixture = await setup();
+    // A well-formed envelope a newer bridge build would produce, using a kind this service's schema
+    // does not (yet) list — everything else about the event is valid.
+    const future = { id: 'future-event', sessionId: 'one', kind: 'context.updated', occurredAt: new Date().toISOString() };
+    const path = fixture.write(future as unknown as ObservationEvent, 'aaaaaaaa-0000-4000-8000-000000000001.json');
+    await fixture.drain();
+    expect(existsSync(path)).toBe(false);
+    const newerPath = join(fixture.spool, 'newer', 'aaaaaaaa-0000-4000-8000-000000000001.json');
+    expect(existsSync(newerPath)).toBe(true);
+    expect(JSON.parse(readFileSync(newerPath, 'utf8'))).toEqual(future);
+    expect(fixture.store().snapshot().state.observation!.connections[0].newerEventCount).toBe(1);
+    // Never counted as a coverage-gap loss — it wasn't dropped, only deferred.
+    expect(fixture.store().snapshot().state.observation!.connections[0].droppedEvents).toBe(0);
+
+    // Simulate a later service build that does understand this kind: place an already-valid event
+    // directly where the quarantine would have put it, and confirm the next drain delivers it and
+    // empties newer/ — this is the re-drain path, not a fresh write into the main spool.
+    writeFileSync(newerPath, JSON.stringify(fixture.observed('session.start', 'now-understood')));
+    await fixture.drain();
+    await vi.waitFor(() => expect(existsSync(newerPath)).toBe(false), SETTLE);
+    expect(fixture.store().snapshot().state.handoffs.length + (fixture.store().snapshot().state.agents.length)).toBeGreaterThan(0);
+    expect(fixture.store().snapshot().state.observation!.connections[0].newerEventCount).toBe(0);
+  });
+
+  // Also timed out at the default 10 seconds under the same machine load (0.7 seconds alone); its 200-file
+  // fixture is the point of the test, so only the limit is raised.
+  it('leaves a newer-format event in place with a lower-bound loss once the bounded newer/ folder is full, never deleting it', { timeout: 60_000 }, async () => {
+    const fixture = await setup();
+    mkdirSync(join(fixture.spool, 'newer'), { recursive: true });
+    // Fill newer/ to its cap directly (bypassing the drain loop, which would otherwise take many
+    // cycles) so this test exercises the overflow branch specifically.
+    for (let i = 0; i < 200; i++) {
+      const id = `bbbbbbbb-0000-4000-8000-${String(i).padStart(12, '0')}`;
+      writeFileSync(join(fixture.spool, 'newer', `${id}.json`), JSON.stringify({ id, sessionId: 'one', kind: 'future.kind', occurredAt: new Date().toISOString() }));
+    }
+    const overflow = { id: 'overflow-event', sessionId: 'one', kind: 'future.kind', occurredAt: new Date().toISOString() };
+    const path = fixture.write(overflow as unknown as ObservationEvent, 'cccccccc-0000-4000-8000-000000000001.json');
+    await fixture.drain();
+    // Never deleted, never moved — left exactly where the bridge wrote it.
+    expect(existsSync(path)).toBe(true);
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(overflow);
+    expect(fixture.store().snapshot().state.observation!.connections[0]).toMatchObject({ droppedEvents: 1, droppedEventsExact: false });
+    expect(readdirSync(join(fixture.spool, 'newer'))).toHaveLength(200);
   });
 });
 
@@ -193,7 +250,7 @@ describe('local hook bridge fixtures without native tools', () => {
     const fixture = await setup();
     const result = await invokeBridge(bridgeConfigPath(fixture.directory, fixture.record.connection.id), { cwd: fixture.root, session_id: 'fixture-native', hook_event_name: 'Stop', last_assistant_message: 'Check completed. api_key=fixture-private' });
     expect(result).toEqual({ code: 0, stdout: '{}', stderr: '' });
-    expect(readdirSync(fixture.spool)).toHaveLength(1); await fixture.drain();
+    expect(spoolEntries(fixture.spool)).toHaveLength(1); await fixture.drain();
     expect(fixture.store().snapshot().state.handoffs).toHaveLength(1); expect(JSON.stringify(fixture.store().snapshot())).not.toContain('fixture-private');
   });
 
@@ -204,7 +261,7 @@ describe('local hook bridge fixtures without native tools', () => {
     for (let index = 0; index < SPOOL_EVENT_LIMIT; index++) writeFileSync(join(fixture.spool, `${randomUUID()}.json`), '{}');
     const full = await invokeBridge(config, { cwd: fixture.root, session_id: 'fixture-native', hook_event_name: 'Stop', last_assistant_message: 'Must report the missing event.' });
     expect(full).toEqual({ code: 0, stdout: '{}', stderr: '' });
-    expect(readdirSync(fixture.spool).filter(name => name.startsWith('coverage-gap'))).toEqual(['coverage-gap']);
-    expect(readdirSync(fixture.spool).filter(name => name.endsWith('.json'))).toHaveLength(SPOOL_EVENT_LIMIT);
+    expect(spoolEntries(fixture.spool).filter(name => name.startsWith('coverage-gap'))).toEqual(['coverage-gap']);
+    expect(spoolEntries(fixture.spool).filter(name => name.endsWith('.json'))).toHaveLength(SPOOL_EVENT_LIMIT);
   });
 });

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, mkdir, writeFile, readFile, rm, realpath, symlink, open, chmod } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, realpath, symlink, open, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative, isAbsolute } from 'node:path';
 import { execFile } from 'node:child_process';
@@ -17,6 +17,7 @@ import { minimalEnvironment, startCodex } from '../../apps/service/src/runner/rp
 import { executeWorkerTool } from '../../apps/service/src/runner/api-tools';
 import { prepareSourceTree, releaseSourceTree } from '../../apps/service/src/runner/source-tree';
 import { accountFingerprint } from '../../apps/service/src/runner/native';
+import { platformTest } from '../helpers/real-tool-test';
 
 vi.mock('../../apps/service/src/runner/rpc', async importOriginal => {
   const actual = await importOriginal<typeof import('../../apps/service/src/runner/rpc')>();
@@ -139,7 +140,8 @@ describe('managed run authorization and durable lifecycle', { timeout: 30000 }, 
     expect(await sourceFingerprint(run.worktreePath!, repo, [repo], task.baseCommit)).not.toBe(run.sourceFingerprint);
     await expect(service.verifyIntegration(task.id, 'mode-tamper-verify')).rejects.toMatchObject({ code: 'worktree_changed' });
   });
-  it.skipIf(process.platform === 'win32')('includes an unstaged Unix owner executable-bit change in source evidence', async () => {
+  // A platform gate, not a real tool: shown in the report as skipped WITH a written reason (FD-06). The Windows counterpart just below covers the same guard.
+  platformTest('includes an unstaged Unix owner executable-bit change in source evidence', { not: 'win32', why: 'it needs a real Unix executable bit, which Windows does not have' }, async () => {
     const { service, create, repo } = await setup();
     await execute('git', ['-C', repo, 'config', 'core.fileMode', 'true']);
     const task = await create('unix-mode-draft'); await service.approve(task.id, task.approvalHash, 'unix-mode-approved');
@@ -148,7 +150,7 @@ describe('managed run authorization and durable lifecycle', { timeout: 30000 }, 
     await chmod(join(run.worktreePath!, 'source.ts'), 0o755);
     expect(await sourceFingerprint(run.worktreePath!, repo, [repo], task.baseCommit)).not.toBe(run.sourceFingerprint);
   });
-  it.skipIf(process.platform !== 'win32')('refuses to infer Git executable modes from Windows stat when core.fileMode is true', async () => {
+  platformTest('refuses to infer Git executable modes from Windows stat when core.fileMode is true', { only: 'win32', why: 'it checks that Windows file metadata is refused as executable-mode evidence' }, async () => {
     const { service, create, repo } = await setup(), task = await create('unavailable-mode-draft');
     await service.approve(task.id, task.approvalHash, 'unavailable-mode-approved');
     await vi.waitFor(() => expect(service.status().runs[0]!.status).toBe('awaiting_review'), { timeout: 5000 });
@@ -311,6 +313,30 @@ describe('managed run authorization and durable lifecycle', { timeout: 30000 }, 
     await writeFile(join(repo, 'source.ts'), 'export const value = 3;\n'); await execute('git', ['-C', repo, 'add', 'source.ts']); await execute('git', ['-C', repo, 'commit', '-q', '-m', 'Changed fixture']);
     await expect(service.approve(second.id, second.approvalHash, 'changed-head')).rejects.toMatchObject({ code: 'repository_changed' });
     expect(service.status().runs).toHaveLength(0);
+  });
+  // CH-02: every other test here uses an executor whose preflight reports ready. Nothing pinned the refusal, which is the whole
+  // reason the Tasks drawer can say "nothing can start on this computer" and mean it (approval repeats the checks before any commit).
+  it('refuses approval with runner_preflight_failed and creates no run, worktree, branch, agent, reservation or report while the execution checks fail', async () => {
+    const { service, store, repo, directory, executor, create } = await setup(), task = await create('blocked-draft');
+    const ready = executor.preflight;
+    executor.preflight = vi.fn(async tool => ({ tool, ready: false, checkedAt: new Date().toISOString(), checks: [{ name: 'Fixture sandbox boundary', passed: false, message: 'Fixture execution boundary unavailable.' }, { name: 'Fixture transport', passed: true, message: 'Fixture transport is fine.' }] }));
+    const worktrees = join(directory, 'data', 'managed', 'fixture-workspace', 'worktrees');
+    await expect(service.approve(task.id, task.approvalHash, 'blocked-approve')).rejects.toMatchObject({ code: 'runner_preflight_failed', statusCode: 503, message: 'Fixture execution boundary unavailable.' });
+    await expect(service.approve(task.id, task.approvalHash, 'blocked-approve-again')).rejects.toMatchObject({ code: 'runner_preflight_failed' });
+    expect(executor.preflight).toHaveBeenCalledWith('openai-api');
+    expect(executor.execute).not.toHaveBeenCalled();
+    expect(service.status().runs).toEqual([]);
+    expect(service.status().tasks[0]).toMatchObject({ id: task.id, status: 'draft', runId: null, approvedAt: null });
+    const state = store.snapshot().state;
+    expect([state.agents, state.handoffs, state.workflow!.reservations, state.workflow!.manager.queueReportIds]).toEqual([[], [], [], []]);
+    await expect(readdir(worktrees)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await execute('git', ['-C', repo, 'worktree', 'list', '--porcelain'])).stdout.match(/^worktree /gm)).toHaveLength(1);
+    expect((await execute('git', ['-C', repo, 'branch', '--list', 'agent-town/*'])).stdout).toBe('');
+    // Nothing was consumed: once the checks pass, the same exact draft approves and starts its one run.
+    executor.preflight = ready;
+    await service.approve(task.id, task.approvalHash, 'approve-after-checks-pass');
+    await vi.waitFor(() => expect(service.status().runs[0]?.status).toBe('awaiting_review'), { timeout: 5000 });
+    expect(service.status().runs).toHaveLength(1);
   });
   it('holds concurrency across settled requests and cancellation preserves the worktree', async () => {
     const { service, executor, create, store } = await setup();

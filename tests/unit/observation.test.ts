@@ -132,14 +132,12 @@ describe('observed agent transitions', () => {
 });
 
 describe('observation delivery and setup', () => {
-  it('keeps one active tool connection when concurrent setup requests finish credential protection together', async () => {
+  it('keeps one active tool connection when concurrent setup requests race for the same project (WS2-02: now serialized per project)', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'agent-town-observation-race-'));
     const root = join(directory, 'repo'); mkdirSync(root);
     const store = new Store(join(directory, 'town.sqlite'), seed(root));
     const secrets = new Map<string, string>();
-    let arrivals = 0, release!: () => void;
-    const bothProtected = new Promise<void>(resolve => { release = resolve; });
-    const vault: CredentialVault = { available: true, put: async (id, value) => { secrets.set(id, value); if (++arrivals === 2) release(); await bothProtected; }, get: async id => secrets.get(id) ?? null, delete: async id => { secrets.delete(id); } };
+    const vault: CredentialVault = { available: true, put: async (id, value) => { secrets.set(id, value); }, get: async id => secrets.get(id) ?? null, delete: async id => { secrets.delete(id); } };
     const app = Fastify();
     app.setErrorHandler((error, _request, reply) => reply.code(error instanceof IdentityError ? error.statusCode : 500).send({ message: error instanceof Error ? error.message : 'Request failed' }));
     const api = registerObservationApi(app, { directory, vault, scoped: () => ({ ownerId: '101', store }), workspace: () => store });
@@ -195,7 +193,8 @@ describe('observation delivery and setup', () => {
     const original = { env: { SECRET: 'fixture-original-value' }, hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo existing' }] }] } };
     writeFileSync(path, JSON.stringify(original));
     const saved = new Map<string, string>();
-    const vault: CredentialVault = { available: true, put: async (id, value) => { saved.set(id, value); }, get: async id => saved.get(id) ?? null, delete: async id => { saved.delete(id); } };
+    // Like the real vault: an empty value or one over 16,000 bytes is refused (H0-10).
+    const vault: CredentialVault = { available: true, put: async (id, value) => { if (!value || Buffer.byteLength(value) > 16_000) throw new IdentityError('credential_invalid', 'Invalid protected credential value.'); saved.set(id, value); }, get: async id => saved.get(id) ?? null, delete: async id => { saved.delete(id); } };
     const record = { connection: source, workspaceId: 'workspace-one', ownerId: '101', repoPath: root };
     try {
       const setup = observationSetup(record, directory); expect(setup.config).not.toContain('fixture-original-value');

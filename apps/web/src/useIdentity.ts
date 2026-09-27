@@ -238,8 +238,12 @@ export function useIdentity() {
       accept(next); setNotice('Signed out. Private workspace details are closed.');
     }),
     disconnectGithub: () => action(async () => {
-      const next = await request<BrowserSession>('/auth/github/disconnect');
-      accept(next); setNotice('GitHub credentials removed. Sign in with GitHub again to reconnect.');
+      // The route only confirms the stored credential was removed ({ ok: true }); it is not a
+      // session and must never be handed to accept() as one (SP-2, that blanked the app). The
+      // browser session itself is untouched by disconnect, so re-reading it keeps sign-in intact.
+      await request('/auth/github/disconnect');
+      await refreshSession();
+      setNotice('GitHub credential removed. Sign in with GitHub again to reconnect.');
     }),
     createWorkspace: (name: string, kind: 'personal' | 'company') => action(async () => {
       const result = await request<{ workspace: WorkspaceSummary }>('/workspaces', { name, kind });

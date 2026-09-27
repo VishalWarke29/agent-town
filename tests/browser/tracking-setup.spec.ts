@@ -64,10 +64,21 @@ async function trackingFixture(page: Page) {
 
 async function enterTracking(page: Page) {
   await page.getByRole('button', { name: 'Local project', exact: true }).click();
-  await page.getByTestId('room-context').getByRole('button', { name: 'Set up tracking', exact: true }).click();
+  // H0-08: the room header's old "Set up tracking" button is now the quiet "Watch sessions
+  // (optional)" link, which opens the house inspector with the Watch section already expanded
+  // (not the manual form). Reach the manual form the rest of this test drives through the Watch
+  // section's own "Manual setup for other tools" link, same as any other visitor would.
+  await page.getByTestId('room-context').getByRole('button', { name: 'Watch sessions (optional)', exact: true }).click();
+  await page.getByRole('button', { name: 'Manual setup for other tools', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Set up local agent tracking', exact: true })).toBeVisible();
 }
 async function registerProfile(page: Page) {
+  // H0-09: the Agent tool select starts on the blank "Choose a tool" option, so
+  // NativeTrackingPanel has no provider to match until this is chosen explicitly.
+  await page.getByRole('combobox', { name: 'Agent tool', exact: true }).selectOption('codex');
+  // "Register a local profile" is a collapsed <details> disclosure; its fields (including
+  // "Use detected profile folder") are not present until it is opened.
+  await page.getByText('Register a local profile', { exact: true }).click();
   await page.getByRole('button', { name: 'Use detected profile folder', exact: true }).click();
   await page.getByRole('button', { name: 'Register profile', exact: true }).click();
   await expect(page.getByRole('combobox', { name: 'Local agent profile', exact: true })).toHaveValue(sourceId);
@@ -105,7 +116,9 @@ test('house tracking setup discovers unknown sessions, reconciles activity and p
 test('inventory pages and hidden choices remain available independently of live characters', async ({ page }) => {
   const evidence = await trackingFixture(page);
   await page.getByRole('button', { name: 'Show list view', exact: true }).click();
-  await page.getByRole('button', { name: 'Set up tracking', exact: true }).click();
+  // H0-08: the List view's own old "Set up tracking" button is now the same quiet Watch link.
+  await page.getByRole('button', { name: 'Watch sessions (optional)', exact: true }).click();
+  await page.getByRole('button', { name: 'Manual setup for other tools', exact: true }).click();
   await registerProfile(page);
   await page.getByRole('checkbox', { name: 'Include history older than 30 days' }).check();
   await page.getByRole('button', { name: 'Scan existing sessions', exact: true }).click();
@@ -234,3 +247,79 @@ for (const status of [503, 422] as const) {
     expect(evidence.pageErrors).toEqual([]);
   });
 }
+
+// H0-08: the five old "Set up tracking" buttons become one quiet "Watch sessions (optional)" text
+// link that opens the house inspector with its Watch section already expanded, sending nothing.
+test('the quiet Watch link opens the inspector with the Watch section expanded and sends nothing', async ({ page }, testInfo) => {
+  const evidence = await trackingFixture(page);
+  await page.getByRole('button', { name: 'Local project', exact: true }).click();
+  // DES-02 RH-2 / H0-08 ACC: the empty room says "No one lives here yet", never "Find existing local sessions".
+  await expect(page.getByTestId('room-context')).toContainText('No one lives here yet. Only sessions you choose to watch appear here.');
+  const watchLink = page.getByTestId('room-context').getByRole('button', { name: 'Watch sessions (optional)', exact: true });
+  await expect(watchLink).toBeVisible();
+  // ACC: "No entry point is a primary or promotional button" — a quiet text link, not `.button`.
+  await expect(watchLink).toHaveClass('text-button');
+  await page.screenshot({ path: testInfo.outputPath('room-header-watch-link.png') });
+  await watchLink.click();
+  const watchPanel = page.locator('.inspector-watch');
+  await expect(watchPanel).toBeVisible();
+  // The section is already expanded ("Hide details" only shows once open) with no "Check this
+  // computer" press of its own, and its manual-setup escape hatch is reachable immediately.
+  await expect(watchPanel.getByRole('button', { name: 'Hide details', exact: true })).toBeVisible();
+  await expect(watchPanel.getByRole('button', { name: 'Manual setup for other tools', exact: true })).toBeVisible();
+  await watchPanel.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath('watch-link-expanded.png') });
+  expect(evidence.calls, `opening the Watch link sent a request.\nCalls: ${JSON.stringify(evidence.calls)}`).toEqual([]);
+  expect(evidence.remote).toEqual([]); expect(evidence.pageErrors).toEqual([]);
+});
+
+// H0-08 fixer pass, 25 September 2026 (review finding #2, plus one more this pass found while
+// writing the regression below): the List view's, the Agents drawer's and RepositoryAgents.tsx's
+// own copies of the "Watch sessions (optional)" link had no min-height rule at all and rendered
+// well under DES-02 section 6's "every button and link target is at least 44 px tall". The room
+// header's own copy relies on `.room-context .text-button { min-height: 44px }` (styles.css), but
+// a same-specificity, later `.room-actions .text-button { min-height: 26px }` mobile override
+// (styles.css, <=560px) wins the cascade there and silently drops it back to 26px on phones — a
+// real touch-target regression the review's own desktop+mobile measurement did not catch. All
+// four now carry their own inline `minHeight: 44`, which no stylesheet rule can be overridden by,
+// alongside the unchanged `text-button` class. This measures every instance at once and fails
+// without the change (confirmed red on mobile before the room header's own inline style was added).
+test('every "Watch sessions (optional)" link meets the 44px touch target, not just the room header', async ({ page }, testInfo) => {
+  const evidence = await trackingFixture(page);
+
+  await page.getByRole('button', { name: 'Local project', exact: true }).click();
+  const roomLink = page.getByTestId('room-context').getByRole('button', { name: 'Watch sessions (optional)', exact: true });
+  await expect(roomLink).toBeVisible();
+  expect((await roomLink.boundingBox())!.height, 'room header Watch link').toBeGreaterThanOrEqual(44);
+  await page.getByRole('button', { name: 'Back to town', exact: true }).click();
+
+  // List view's own top-level link, shown with no repository selected.
+  await page.getByRole('button', { name: 'Show list view', exact: true }).click();
+  const listLink = page.getByRole('button', { name: 'Watch sessions (optional)', exact: true });
+  await expect(listLink).toBeVisible();
+  await listLink.scrollIntoViewIfNeeded();
+  expect((await listLink.boundingBox())!.height, 'List view Watch link').toBeGreaterThanOrEqual(44);
+  await page.screenshot({ path: testInfo.outputPath('list-view-watch-link.png') });
+  await page.getByRole('button', { name: 'Show world', exact: true }).click();
+
+  // Agents drawer's own top-level link.
+  await page.getByRole('button', { name: 'Open agents', exact: true }).click();
+  const agentsLink = page.getByTestId('left-drawer').getByRole('button', { name: 'Watch sessions (optional)', exact: true });
+  await expect(agentsLink).toBeVisible();
+  await agentsLink.scrollIntoViewIfNeeded();
+  expect((await agentsLink.boundingBox())!.height, 'Agents drawer Watch link').toBeGreaterThanOrEqual(44);
+  await page.screenshot({ path: testInfo.outputPath('agents-drawer-watch-link.png') });
+  await page.getByRole('button', { name: 'Close navigation', exact: true }).click();
+
+  // RepositoryAgents.tsx's own link, inside the world-view roster drawer.
+  await page.getByRole('button', { name: 'Local project', exact: true }).click();
+  await page.getByRole('button', { name: 'Agents in this repository', exact: true }).click();
+  const rosterLink = page.getByTestId('right-drawer').getByRole('button', { name: 'Watch sessions (optional)', exact: true });
+  await expect(rosterLink).toBeVisible();
+  await rosterLink.scrollIntoViewIfNeeded();
+  expect((await rosterLink.boundingBox())!.height, 'roster (RepositoryAgents.tsx) Watch link').toBeGreaterThanOrEqual(44);
+  await page.screenshot({ path: testInfo.outputPath('roster-watch-link.png') });
+
+  expect(evidence.calls, `these Watch links sent a request just by rendering.\nCalls: ${JSON.stringify(evidence.calls)}`).toEqual([]);
+  expect(evidence.remote).toEqual([]); expect(evidence.pageErrors).toEqual([]);
+});

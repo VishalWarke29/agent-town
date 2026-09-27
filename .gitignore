@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .data/
+tmp/
 .codex/
 .claude/
 AGENTS.md
@@ -17,3 +18,8 @@ playwright-report/
 *.log
 *.tsbuildinfo
 .DS_Store
+__pycache__/
+*.pyc
+/.cursor/
+/.github/hooks/
+/.github/copilot/settings.local.json

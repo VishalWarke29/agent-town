@@ -27,7 +27,12 @@ function SelectedSessionReports({ state, identity, agentId, available }: Props) 
     if (!available) { setLoaded(null); setFailure(null); return; }
     const abort = new AbortController();
     identity.request<AgentReportPage>(`${prefix}?offset=${offset}&limit=${pageSize}`, undefined, AbortSignal.any([abort.signal, AbortSignal.timeout(20000)]), 'GET')
-      .then(value => { if (!abort.signal.aborted) { setLoaded({ key, page: value }); setFailure(null); } })
+      .then(value => {
+        if (abort.signal.aborted) return;
+        // A response from an older or mismatched service must fail visibly here, not throw while rendering.
+        if (!value || !Array.isArray(value.reports) || typeof value.reportCount !== 'number') { setFailure({ key, message: 'Saved reports returned an unexpected response. Retry, or restart the local service on the current build.' }); return; }
+        setLoaded({ key, page: value }); setFailure(null);
+      })
       .catch(cause => {
         if (abort.signal.aborted) return;
         const message = cause instanceof Error && cause.name === 'TimeoutError' ? 'Saved reports took too long to load. Retry when the local service is ready.'
@@ -64,7 +69,7 @@ function EvidenceList({ title, values }: { title: string; values: string[] }) {
 function SavedReport({ report }: { report: Handoff }) {
   const details = report.details;
   return <article className="observation-card" aria-label={`Report saved ${when(report.createdAt)}`}>
-    <strong>{details?.outcome === 'completed-response' ? 'Response finished' : details?.outcome.replaceAll('-', ' ') ?? 'Reported response'}</strong>
+    <strong>{details?.outcome === 'completed-response' ? 'Response finished' : typeof details?.outcome === 'string' ? details.outcome.replaceAll('-', ' ') : 'Reported response'}</strong>
     <dl className="facts">
       <div><dt>Report storage</dt><dd>Saved <time dateTime={report.createdAt}>{when(report.createdAt)}</time></dd></div>
       <div><dt>Manager processing</dt><dd>{report.status === 'processed' ? 'Processed' : 'Pending'}</dd></div>

@@ -1,11 +1,11 @@
 import { createHash } from 'node:crypto';
 import type { ManagerQueueStatus, TownState } from '@agent-town/contracts';
-import { billingDay, maximumRequestCost, reserveOperation, WorkflowError, workflowState } from './budget.js';
+import { billingDay, eligibleForManager, maximumRequestCost, reserveOperation, WorkflowError, workflowState } from './budget.js';
 import { buildManagerInput } from './context.js';
 
 export function queueBasis(state: TownState, now: string): string {
   const workflow = workflowState(state);
-  return createHash('sha256').update(JSON.stringify({ config: workflow.manager.config, policy: workflow.policy,
+  return createHash('sha256').update(JSON.stringify({ config: workflow.manager.config, policy: workflow.policy, baselineAt: workflow.manager.baselineAt ?? null,
     connections: workflow.connections, reservations: workflow.reservations, reports: state.handoffs, contextVersion: state.manager.version,
     jobs: workflow.manager.jobs.map(job => ({ id: job.id, status: job.status })), repositories: state.repositories.map(repo => repo.id),
     tasks: state.runner?.tasks.map(task => ({ id: task.id, draft: task.draft, status: task.status, contextVersion: task.contextVersion, baseCommit: task.baseCommit, integration: task.integration })),
@@ -32,13 +32,18 @@ export function managerQueueStatus(state: TownState, now: string): ManagerQueueS
       model: config.model, amountMicroUsd: Math.max(1, maximumRequestCost(config.model, 0, config.maxOutputTokens)), runBudgetMicroUsd: config.requestBudgetMicroUsd }, now);
   } catch (error) { return error instanceof WorkflowError ? make('waiting', error.code, error.message) : make('waiting', 'manager_configuration_invalid', 'Review the saved manager configuration before processing.'); }
   const failed = new Set(manager.jobs.filter(job => job.status === 'failed').flatMap(job => job.reportIds));
-  const eligible = reports.filter(report => !failed.has(report.id));
-  if (!eligible.length) return make('waiting', 'manager_explicit_retry', 'Previous attempts failed. Review the saved operation and use the explicit paid action to retry; automatic retry is disabled.');
+  const retryable = reports.filter(report => !failed.has(report.id));
+  if (!retryable.length) return make('waiting', 'manager_explicit_retry', 'Previous attempts failed. Review the saved operation and use the explicit paid action to retry; automatic retry is disabled.');
+  const eligible = retryable.filter(report => eligibleForManager(report, state));
+  if (!eligible.length) return make('waiting', 'manager_baseline_pending', 'The saved reports are older than when the manager started. They are excluded from processing until a reviewed way to include older reports exists; newer reports are unaffected.');
   if (!state.repositories.some(repo => repo.id === eligible[0].repoId)) return make('waiting', 'report_repository_missing', 'The oldest report references an unavailable repository. Review its evidence before processing.');
   try { if (buildManagerInput(state, [eligible[0]]).evidence.inputBytes > 100000) return make('waiting', 'manager_input_large', 'One report and the saved context exceed the byte bound. Review the evidence or context before processing.'); }
   catch (error) { return make('waiting', error instanceof WorkflowError ? error.code : 'manager_input_invalid', 'The saved report bundle needs review before processing.'); }
   const saved = manager.waitingStatus;
-  if (saved?.state === 'waiting' && saved.basisHash === queueBasis(state, now)) return { ...saved, checkedAt: now, reportIds: reports.map(report => report.id), pendingCount: reports.length };
+  // A transient wait releases itself once its backoff time passes, even with no other
+  // change, so scheduling can retry without waiting for queueBasis to change.
+  if (saved?.state === 'waiting' && saved.basisHash === queueBasis(state, now) && (!saved.retryAt || Date.parse(now) < Date.parse(saved.retryAt)))
+    return { ...saved, checkedAt: now, reportIds: reports.map(report => report.id), pendingCount: reports.length };
   const start = Date.parse(eligible[0].createdAt) + 30000;
   if (Date.parse(now) < start) return make('waiting', 'manager_batch_waiting', 'Automatic processing is waiting for the 30-second report batch window. The explicit paid action can process eligible reports sooner.', new Date(start).toISOString());
   const starts = manager.automaticStarts.filter(value => Date.parse(now) - Date.parse(value) < 3600000).sort();

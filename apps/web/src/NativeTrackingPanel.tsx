@@ -7,7 +7,9 @@ import type { IdentityController } from './useIdentity';
 
 interface Props {
   state: TownState; identity: IdentityController; available: boolean;
-  repoId: string; provider: ToolSurface; sourceId: string;
+  // A blank provider means no tool has been chosen yet (H0-09, D38): the profile check below still
+  // reads (repoId alone drives it), but every profile action stays disabled until a real tool is picked.
+  repoId: string; provider: ToolSurface | ''; sourceId: string;
   onSourceChange: (id: string) => void;
   onToolStatus?: (status: NativeToolStatus | null) => void;
 }
@@ -96,12 +98,12 @@ export function NativeTrackingPanel({ state, identity, available, repoId, provid
     {error && <p className="form-error" role="alert">{error}</p>}
     {detectionError && <p className="form-error" role="alert">{detectionError}</p>}
     {notice && <p className="form-notice" role="status">{notice}</p>}
-    {!setup ? <p className="muted small" role="status">{detectionError ? 'Tool detection could not complete. Use Refresh tool status to retry.' : 'Checking local tools…'}</p> : <>
+    {!provider ? <p className="muted small" role="status">Choose a tool above to see its detected local profile.</p> : !setup ? <p className="muted small" role="status">{detectionError ? 'Tool detection could not complete. Use Refresh tool status to retry.' : 'Checking local tools…'}</p> : <>
       <dl className="facts tracking-readiness"><div><dt>Local profile</dt><dd>{tool?.detected ? 'Profile folder found' : 'No profile folder detected automatically'}</dd></div><div><dt>Version</dt><dd>{tool?.version ?? 'Unavailable'}</dd></div><div><dt>History discovery</dt><dd>{tool?.discovery === 'available' ? 'Available for supported local profiles' : tool?.discovery === 'unsupported' ? 'Not supported for this surface' : 'Unavailable'}</dd></div></dl>
-      <p className="muted small">A profile folder does not verify installation, sign-in, or live tracking.</p>
+      <p className="muted small">A profile folder does not verify installation, sign-in, or active watching.</p>
       {tool?.message && <p className="muted small">{tool.message}</p>}
       <div className="setup-form"><label>Local agent profile<select value={sourceId} disabled={!!busy || !available} onChange={event => onSourceChange(event.target.value)}><option value="">Choose or register a profile</option>{sources.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label></div>
-      <details className="workflow-details" open={sources.length === 0 || undefined}><summary>Register a local profile</summary>
+      <details className="workflow-details"><summary>Register a local profile</summary>
         <form className="setup-form" onSubmit={event => { event.preventDefault(); if (!homePath.trim() || !label.trim()) return; void run('register', async signal => {
           const result = await identity.request<{ id: string }>(`${prefix}/native-sources`, { provider, label: label.trim(), homePath: homePath.trim() }, signal);
           if (signal.aborted) return;

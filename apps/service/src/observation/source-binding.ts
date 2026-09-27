@@ -1,7 +1,7 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
-import { observationEventSchema, surfaceSchema, type ObservationEvent, type ToolSurface } from '@agent-town/contracts';
+import { eventFieldSupported, eventKindSupported, observationEventSchema, serviceCapabilitiesSchema, surfaceSchema, SERVICE_CAPABILITIES_BYTE_LIMIT, SERVICE_CAPABILITIES_FILE, type ObservationEvent, type ServiceCapabilities, type ToolSurface } from '@agent-town/contracts';
 import { normalizeObservationPath, safeHookProjectPath, sameObservationPath } from './paths.js';
 import { hookRejectionCodes } from './normalize.js';
 
@@ -24,6 +24,17 @@ export function nativeHookProducer(input: unknown): ToolSurface | undefined {
   return undefined;
 }
 
+/** Copilot CLI and Copilot in VS Code also read `.claude/settings.local.json`. For PascalCase events they send
+ * snake_case fields plus an ISO `timestamp`; Claude Code's own hook input has no timestamp, and Cursor,
+ * Codex and camelCase Copilot payloads are excluded by their own fingerprints. Only used to stop such a
+ * callback from being attributed to Claude Code. */
+function looksLikeCopilotClaudeImport(input: unknown): boolean {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return false;
+  const data = input as Record<string, unknown>;
+  return typeof data.session_id === 'string' && typeof data.timestamp === 'string' && data.permission_mode === undefined
+    && data.cursor_version === undefined && data.conversation_id === undefined && data.sessionId === undefined;
+}
+
 function readHookConfiguration(path: string, root: string): unknown {
   if (!safeHookProjectPath(root, path)) throw new Error('Unsafe hook path');
   const descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -35,6 +46,39 @@ function readHookConfiguration(path: string, root: string): unknown {
     if (bytes !== before.size || !safeHookProjectPath(root, path) || after.isSymbolicLink() || after.nlink > 1 || after.ino !== before.ino || after.dev !== before.dev || openedAfter.size !== before.size || openedAfter.mtimeMs !== before.mtimeMs) throw new Error('Hook configuration changed');
     return JSON.parse(buffer.subarray(0, bytes).toString('utf8'));
   } finally { closeSync(descriptor); }
+}
+
+/** Bounded, no-follow read of the running service's own capability file from inside its spool
+ * directory. Never throws: a missing file, an oversized one, a symlink, unparseable JSON or a schema
+ * mismatch all read the same as "no evidence of a newer service," the safe default. A bridge
+ * invocation is a short-lived process with no memory between runs, so this always re-reads fresh —
+ * there is nothing to cache. */
+export function readServiceCapabilities(spoolPath: string): ServiceCapabilities | null {
+  try {
+    const path = join(spoolPath, SERVICE_CAPABILITIES_FILE);
+    if (!safeHookProjectPath(spoolPath, path)) return null;
+    const descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    try {
+      const before = fstatSync(descriptor);
+      if (!before.isFile() || before.nlink > 1 || before.size > SERVICE_CAPABILITIES_BYTE_LIMIT) return null;
+      const buffer = Buffer.alloc(before.size), bytes = readSync(descriptor, buffer, 0, buffer.length, 0);
+      const after = lstatSync(path);
+      if (bytes !== before.size || after.isSymbolicLink() || after.nlink > 1 || after.ino !== before.ino || after.dev !== before.dev) return null;
+      const parsed = serviceCapabilitiesSchema.safeParse(JSON.parse(buffer.toString('utf8')));
+      return parsed.success ? parsed.data : null;
+    } finally { closeSync(descriptor); }
+  } catch { return null; }
+}
+
+/** Applies the version guard to one outgoing event: null when the running service (per `capability`)
+ * doesn't understand this event's own kind yet — nothing is written for it, the same as if the native
+ * tool had stayed quiet, never a coverage-gap loss. Otherwise, strips any optional field the service
+ * doesn't understand yet; the four always-required fields are never gated. The bridge only ever emits
+ * less than it knows, never a guess dressed as a real field. */
+export function gateEventForCapability(event: ObservationEvent, capability: ServiceCapabilities | null): ObservationEvent | null {
+  if (!eventKindSupported(event.kind, capability)) return null;
+  const always = new Set(['id', 'sessionId', 'kind', 'occurredAt']);
+  return Object.fromEntries(Object.entries(event).filter(([key]) => always.has(key) || eventFieldSupported(key, capability))) as ObservationEvent;
 }
 
 /** Inspect bounded configuration only. Never run commands or read transcripts. */
@@ -78,6 +122,7 @@ export function hasAmbiguousHookOverlap(config: BridgeConfig): boolean {
 export function resolveHookSource(config: BridgeConfig, input: unknown, environment: NodeJS.ProcessEnv = process.env): { fields: Partial<ObservationEvent>; blocked: boolean; diagnostic?: SourceDiagnostic } {
   const producer = nativeHookProducer(input);
   if (producer && producer !== config.provider) return { fields: {}, blocked: true, diagnostic: 'producer-mismatch' };
+  if (config.provider === 'claude' && looksLikeCopilotClaudeImport(input)) return { fields: {}, blocked: true, diagnostic: 'producer-mismatch' };
   if (hasAmbiguousHookOverlap(config)) return { fields: {}, blocked: true, diagnostic: 'hook-overlap' };
   const fields: Partial<ObservationEvent> = producer ? { producer } : {};
   if (config.version === 2 && config.provider === 'copilot-vscode' && !producer) return { fields, blocked: true, diagnostic: 'source-ambiguous' };
@@ -98,6 +143,41 @@ export function parseSpoolEvent(input: unknown): ObservationEvent | null {
   if (envelope.success) return envelope.data.event;
   const legacy = observationEventSchema.safeParse(input);
   return legacy.success ? legacy.data : null;
+}
+
+export type SpoolEventClassification = { status: 'ok'; event: ObservationEvent } | { status: 'newer' } | { status: 'malformed' };
+
+/**
+ * An issue caused only by an unknown top-level key (`.strict()`), an unrecognized `kind` value, or an
+ * unrecognized/higher envelope `version` is exactly what a NEWER bridge writing a format this service
+ * doesn't understand yet would produce on an otherwise well-formed envelope. Anything else (a missing
+ * or wrongly-typed required field) means the file itself is malformed, not merely from the future.
+ */
+function isNewerFormatIssue(issue: z.core.$ZodIssue): boolean {
+  if (issue.code === 'unrecognized_keys') return true;
+  if (issue.code !== 'invalid_value') return false;
+  const key = issue.path[issue.path.length - 1];
+  return key === 'kind' || key === 'version';
+}
+
+/**
+ * Distinguishes a well-formed-but-future event (move to newer/, never delete) from a genuinely
+ * malformed or unsafe one (delete, as today). Used by the spool drain's keep-newer guard.
+ */
+export function classifySpoolEvent(input: unknown): SpoolEventClassification {
+  const envelope = envelopeSchema.safeParse(input);
+  if (envelope.success) return { status: 'ok', event: envelope.data.event };
+  const legacy = observationEventSchema.safeParse(input);
+  if (legacy.success) return { status: 'ok', event: legacy.data };
+  if (typeof input !== 'object' || input === null) return { status: 'malformed' };
+  const record = input as Record<string, unknown>;
+  const looksEnveloped = 'event' in record && 'version' in record;
+  let issues = (looksEnveloped ? envelope.error : legacy.error)!.issues.filter(issue => issue.path[0] !== 'event');
+  if (looksEnveloped && typeof record.event === 'object' && record.event !== null) {
+    const nested = observationEventSchema.safeParse(record.event);
+    if (!nested.success) issues = [...issues, ...nested.error.issues];
+  }
+  return issues.length > 0 && issues.every(isNewerFormatIssue) ? { status: 'newer' } : { status: 'malformed' };
 }
 
 export function normalizeBridgePaths(config: BridgeConfig): BridgeConfig | null {

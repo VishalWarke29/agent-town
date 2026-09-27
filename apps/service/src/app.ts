@@ -10,6 +10,7 @@ import { projectRoot, Store } from './store.js';
 import { IdentityError, WindowsDpapiVault, type CredentialVault, type IdentityService } from './identity/index.js';
 import { WorkspaceStores } from './workspaces.js';
 import { registerRepositoryApi } from './repository-api.js';
+import { createFolderPicker, type FolderPicker } from './folder-picker.js';
 import { registerObservationApi } from './observation/service.js';
 import { registerWorkflowApi } from './workflow-api.js';
 import { WorkflowError } from './workflow/budget.js';
@@ -17,13 +18,17 @@ import type { WorkflowProvider } from './workflow/provider.js';
 import { registerTelemetryApi } from './telemetry-api.js';
 import { registerRunnerApi } from './runner-api.js';
 import type { RunExecutor } from './runner/types.js';
+import { registerVaultApi } from './vault-api.js';
+import { VaultError } from './vault/errors.js';
 import { buildInfo } from './build-info.js';
 import { registerHistoryApi } from './history-api.js';
 import type { BackupScheduler } from './ops/scheduler.js';
 import { createStateStream } from './state-stream.js';
-import { servedWebBuild } from './served-web.js';
+import { servedWebBuild, bridgeBuild, bridgeRebuiltSinceStart } from './served-web.js';
+import { introspectReadOnlyFile } from './db-visualizer.js';
+import type { DbSchemaSnapshot } from '@agent-town/contracts';
 
-interface Options { database: string; privateDirectory?: string; identity?: IdentityService; vault?: CredentialVault; workflowProvider?: WorkflowProvider; runExecutor?: RunExecutor; backups?: BackupScheduler; port?: number; mode?: ApplicationMode; development?: boolean; developmentWebPort?: number; simulationInterval?: number; logger?: boolean }
+interface Options { database: string; privateDirectory?: string; identity?: IdentityService; vault?: CredentialVault; workflowProvider?: WorkflowProvider; runExecutor?: RunExecutor; folderPicker?: FolderPicker; backups?: BackupScheduler; port?: number; mode?: ApplicationMode; development?: boolean; developmentWebPort?: number; simulationInterval?: number; logger?: boolean }
 interface Session { csrf: string; expires: number; created: number; ownerId: string | null }
 
 export async function createApp(options: Options) {
@@ -97,7 +102,7 @@ export async function createApp(options: Options) {
     const route = request.url.split('?')[0]!;
     const demoRoute = `/api/v1/workspaces/${DEMO_WORKSPACE}`;
     if (mode === 'demo' && (route.startsWith('/api/') || route.startsWith('/ingest/')) &&
-        !['/api/v1/health', '/api/v1/session', `${demoRoute}/snapshot`, `${demoRoute}/events`, `${demoRoute}/demo/commands`].includes(route)) {
+        !['/api/v1/health', '/api/v1/session', `${demoRoute}/snapshot`, `${demoRoute}/events`, `${demoRoute}/demo/commands`, `${demoRoute}/db-schema`].includes(route)) {
       return reply.code(403).send({ code: 'DEMO_ONLY', message: 'Demo mode only serves sample data. Restart in development mode to connect real services.' });
     }
     if (mode === 'production' && (route === demoRoute || route.startsWith(`${demoRoute}/`))) {
@@ -119,7 +124,12 @@ export async function createApp(options: Options) {
     }
   });
 
-  app.get('/api/v1/health', async () => ({ ok: true, version: '0.1.0', mode: 'local', applicationMode: mode, build: buildInfo, servedWeb: await servedWebBuild(join(projectRoot, 'apps/web/dist')), sourceHotReload: !!options.development, hostedDeploymentReady: false, paidWorkEnabledByDefault: false }));
+  app.get('/api/v1/health', async () => {
+    const bridge = await bridgeBuild(join(projectRoot, 'apps/service/dist'));
+    return { ok: true, version: '0.1.0', mode: 'local', applicationMode: mode, build: buildInfo, servedWeb: await servedWebBuild(join(projectRoot, 'apps/web/dist')), bridge,
+      rebuiltPendingRestart: bridgeRebuiltSinceStart(bridge, buildInfo.id, !!options.development),
+      sourceHotReload: !!options.development, hostedDeploymentReady: false, paidWorkEnabledByDefault: false };
+  });
   app.post('/api/v1/session', async (request, reply) => {
     for (const [key, session] of sessions) if (session.expires < Date.now()) invalidate(key);
     const old = request.cookies[COOKIE];
@@ -189,6 +199,15 @@ export async function createApp(options: Options) {
     if (params.id) scopedStore(request);
   });
   app.get(`${prefix}/snapshot`, async request => scopedStore(request).snapshot());
+  app.get(`${prefix}/db-schema`, async request => {
+    const workspaceGroup = scopedStore(request).dbSchemaGroup();
+    // Identity's app.sqlite lives under the private directory, the same fallback this file already
+    // uses for it at line ~50 (options.privateDirectory, or dirname(database)/private for a fixture
+    // that only passes database) — not dirname(database) itself, which was this endpoint's original,
+    // wrong guess and always missed the real file. Absent entirely in demo mode (no identity service).
+    const identityGroup = identity ? introspectReadOnlyFile(join(options.privateDirectory ?? join(dirname(options.database), 'private'), 'app.sqlite'), 'Agent Town sign-in data (shared, not private to this workspace)', 'identity') : null;
+    return { scannedAt: new Date().toISOString(), groups: identityGroup ? [workspaceGroup, identityGroup] : [workspaceGroup] } satisfies DbSchemaSnapshot;
+  });
   app.get(`${prefix}/events`, async (request, reply) => {
     const store = scopedStore(request);
     const query = request.query as { after?: string };
@@ -253,6 +272,8 @@ export async function createApp(options: Options) {
     return result;
   });
 
+  // Created here, and closed first at shutdown, so a slow backup stop never keeps a folder window open.
+  const folderPicker = options.folderPicker ?? createFolderPicker();
   const stopDiscovery = mode === 'demo' ? async () => {} : registerRepositoryApi(app, { store: request => {
     requireOwner(request);
     const result = scopedStore(request);
@@ -260,7 +281,9 @@ export async function createApp(options: Options) {
     return result;
   }, listGitHub: request => identity!.listRepositories(requireOwner(request)),
   listGitHubBackground: store => identity!.listRepositories(identity!.registry.listAllWorkspaces().find(workspace => workspace.id === store.snapshot().state.workspace.id)!.ownerId),
-  stores: () => identity?.registry.listAllWorkspaces().map(workspace => privateStores.get(workspace.ownerId, workspace.id)) ?? [] });
+  stores: () => identity?.registry.listAllWorkspaces().map(workspace => privateStores.get(workspace.ownerId, workspace.id)) ?? [],
+  // The Browse... folder window. Demo mode registers no repository API, so it never gets a picker or a helper.
+  folderPicker });
 
   const observation = identity && options.privateDirectory ? registerObservationApi(app, {
     directory: options.privateDirectory, vault: options.vault ?? new WindowsDpapiVault(),
@@ -299,6 +322,17 @@ export async function createApp(options: Options) {
     stores: () => identity.registry.listAllWorkspaces().map(workspace => privateStores.get(workspace.ownerId, workspace.id)),
   }) : null;
 
+  // Same scoping as runner/telemetry: a private workspace and a real local data directory. Disabled
+  // in demo mode like the repository API, since Vault operates on a connected project's real local
+  // files and demo mode's sample repositories have none.
+  if (identity && options.privateDirectory) registerVaultApi(app, {
+    scoped: request => {
+      requireOwner(request); const selected = scopedStore(request);
+      if (selected.snapshot().state.workspace.mode !== 'private') throw new IdentityError('PRIVATE_WORKSPACE_REQUIRED', 'Select a private workspace first.');
+      return selected;
+    },
+  });
+
   if (identity) registerHistoryApi(app, request => {
     requireOwner(request); const selected = scopedStore(request);
     if (selected.snapshot().state.workspace.mode !== 'private') throw new IdentityError('PRIVATE_WORKSPACE_REQUIRED', 'Select a private workspace first.');
@@ -323,6 +357,7 @@ export async function createApp(options: Options) {
     if (error instanceof IdentityError) return reply.code(error.statusCode).send({ code: error.code, message: error.message, ...(error.restartSignIn ? { restartSignIn: true } : {}) });
     if (error instanceof WorkflowError) return reply.code(error.statusCode).send({ code: error.code, message: error.message });
     if (error instanceof CommandError) return reply.code(409).send({ code: 'STATE_CONFLICT', message: error.message });
+    if (error instanceof VaultError) return reply.code(error.statusCode).send({ code: `VAULT_${error.code.toUpperCase().replaceAll('-', '_')}`, message: error.message, ...(error.findings ? { findings: error.findings } : {}) });
     if ((error as { statusCode?: number }).statusCode === 413) return reply.code(413).send({ code: 'BODY_TOO_LARGE', message: 'This request is too large.' });
     if ((error as { statusCode?: number }).statusCode === 400) return reply.code(400).send({ code: 'INVALID_REQUEST', message: 'The request could not be read.' });
     if ((error as { statusCode?: number }).statusCode === 415) return reply.code(415).send({ code: 'UNSUPPORTED_CONTENT_TYPE', message: 'Send this action as JSON or without a body. Form submissions are not supported.' });
@@ -339,7 +374,7 @@ export async function createApp(options: Options) {
     } catch { app.log.error('The sample simulation could not persist an update.'); }
   }, options.simulationInterval ?? 6000);
   interval.unref();
-  app.addHook('preClose', async () => { clearInterval(interval); for (const close of streams) close(); await backups?.stop(); await stopDiscovery(); await observation?.close(); await telemetry?.close(); await runner?.close(); await workflow?.close(); });
+  app.addHook('preClose', async () => { clearInterval(interval); for (const close of streams) close(); const pickerClosed = folderPicker.close(); await backups?.stop(); await stopDiscovery(); await pickerClosed; await observation?.close(); await telemetry?.close(); await runner?.close(); await workflow?.close(); });
   app.addHook('onClose', async () => { store.close(); privateStores.close(); identity?.close(); sessions.clear(); });
   return { app, store };
 }

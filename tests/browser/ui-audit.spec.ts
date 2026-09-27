@@ -85,15 +85,45 @@ test('long repository context leaves the List roster usable on narrow and short 
   await page.getByRole('button', { name: 'Show list view', exact: true }).click();
   await page.getByRole('button', { name: 'Open repositories', exact: true }).click();
   await page.getByTestId('left-drawer').getByRole('button').filter({ hasText: fixture.repoName }).click();
-  for (const viewport of [{ width: 320, height: 740 }, { width: 844, height: 390 }]) {
+  // 640x360 and 960x540 (UX-04, A11Y-1, RV-1) join the original 320x740 and 844x390 cases: short or
+  // zoomed viewports where the room-context and List compete for the same list-layout height. 320x256
+  // is covered for the List on its own below; combined with an open room-context, its available height
+  // (118px) is still less than the room-context's own 100px minimum, which is unrelated to this fix and
+  // stays a known gap (see the evidence note for UX-04).
+  for (const viewport of [{ width: 320, height: 740 }, { width: 844, height: 390 }, { width: 640, height: 360 }, { width: 960, height: 540 }]) {
     await page.setViewportSize(viewport);
     const context = page.getByTestId('room-context'), list = page.getByRole('region', { name: 'Accessible town list', exact: true });
     await expect(context).toBeVisible(); await expect(list).toBeVisible();
-    await page.screenshot({ path: testInfo.outputPath(`long-room-${viewport.width}.png`) });
+    // A resize does not itself move an existing scroll position; reset to the top first so every case
+    // below reflects a person freshly looking at the List at that size, not scroll state left behind by
+    // a previous size in this loop or by a scrollIntoViewIfNeeded call later in the same iteration.
+    await list.evaluate(element => { element.scrollTop = 0; });
+    await page.screenshot({ path: testInfo.outputPath(`long-room-${viewport.width}x${viewport.height}.png`) });
     const a = await context.boundingBox(), b = await list.boundingBox();
-    expect.soft(!!a && !!b && (a.x + a.width <= b.x + 1 || b.x + b.width <= a.x + 1 || a.y + a.height <= b.y + 1 || b.y + b.height <= a.y + 1), `${viewport.width}px repository controls and List surface do not cover each other`).toBe(true);
+    expect.soft(!!a && !!b && (a.x + a.width <= b.x + 1 || b.x + b.width <= a.x + 1 || a.y + a.height <= b.y + 1 || b.y + b.height <= a.y + 1), `${viewport.width}x${viewport.height} repository controls and List surface do not cover each other`).toBe(true);
+    // The List heading and connection pill stay clear of the top bar and each other (ACC: never sits
+    // under the pill or top bar; heading stays visible), measured before scrolling to the roster below.
+    const metrics = await page.evaluate(() => {
+      const layout = document.querySelector('.list-layout')!.getBoundingClientRect();
+      const topbar = document.querySelector('.topbar')!.getBoundingClientRect();
+      const pill = document.querySelector('.connection-pill')!.getBoundingClientRect();
+      const listView = document.querySelector('.list-view')!.getBoundingClientRect();
+      const heading = document.querySelector('.list-heading h1')!.getBoundingClientRect();
+      return {
+        underTopbar: layout.top < topbar.bottom, underPill: layout.bottom > pill.top,
+        // Full containment (top AND bottom) inside .list-view's own box, not just the top edge: a heading
+        // whose top peeks just inside the scroll container while its bottom is clipped by that container's
+        // own overflow:auto (only the tops of its letters showing) must fail here, not read as "visible".
+        headingVisible: heading.height > 0 && heading.width > 0 && heading.top >= listView.top - 1 && heading.bottom <= listView.bottom + 1,
+        scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth,
+      };
+    });
+    expect.soft(metrics.underTopbar, `${viewport.width}x${viewport.height} List view never sits under the top bar`).toBe(false);
+    expect.soft(metrics.underPill, `${viewport.width}x${viewport.height} List view never sits under the connection pill`).toBe(false);
+    expect.soft(metrics.headingVisible, `${viewport.width}x${viewport.height} List heading stays visible`).toBe(true);
+    expect.soft(metrics.scrollWidth <= metrics.clientWidth + 1, `${viewport.width}x${viewport.height} creates no horizontal page scroll`).toBe(true);
     await list.getByRole('button', { name: `Inspect ${fixture.agentName}`, exact: true }).scrollIntoViewIfNeeded();
-    expect.soft(await targetReachable(list.getByRole('button', { name: `Inspect ${fixture.agentName}`, exact: true })), `${viewport.width}px roster remains reachable`).toBe(true);
+    expect.soft(await targetReachable(list.getByRole('button', { name: `Inspect ${fixture.agentName}`, exact: true })), `${viewport.width}x${viewport.height} roster remains reachable`).toBe(true);
   }
   expect(fixture.errors).toEqual([]); expect(fixture.unexpected).toEqual([]); expect(fixture.mutations).toEqual([]);
 });
@@ -184,5 +214,130 @@ test('ordinary UI text is not editable while real text fields retain normal care
   await expect(input).toHaveValue('Audit worker'); await expect(input).toBeFocused();
   expect(await input.evaluate(element => { const field = element as HTMLInputElement; return { start: field.selectionStart, end: field.selectionEnd }; })).toEqual({ start: 12, end: 12 });
   await expect(drawer.locator('.agent-list .agent-row')).toHaveCount(1);
+  expect(fixture.errors).toEqual([]); expect(fixture.unexpected).toEqual([]); expect(fixture.mutations).toEqual([]);
+});
+
+// UX-04 (A11Y-1, RV-1; WCAG 1.4.10 reflow, 1.4.4 resize text): at 640x360, 844x390, 960x540 and
+// 320x256 (short or zoomed viewports) a drawer's header, tabs and footer used to leave only a ~24px
+// content slit, and the List view collapsed the same way. Verified against the "variant B" fix in
+// .data/ui-audit/verify-4523/probe.mjs; see docs/02-ui-and-animation.md and docs/36-ui-reaudit.md.
+const SHORT_VIEWPORTS = [
+  { width: 640, height: 360, minContent: 160 },
+  { width: 844, height: 390, minContent: 160 },
+  { width: 960, height: 540, minContent: 160 },
+  { width: 320, height: 256, minContent: 118 },
+] as const;
+
+test('short and zoomed viewports keep the Agents drawer content, its zero-AI footer and every control readable', async ({ page }, testInfo) => {
+  const fixture = await uiFixture(page);
+  const original = fixture.snapshot.state.agents[0]!;
+  fixture.snapshot.state.agents = Array.from({ length: 3 }, (_, index) => ({ ...original, id: `audit-worker-${index}`, name: `Audit worker ${index}` }));
+  await page.setViewportSize({ width: 640, height: 360 });
+  await ready(page);
+  await page.getByRole('button', { name: 'Show list view', exact: true }).click();
+
+  for (const { width, height, minContent } of SHORT_VIEWPORTS) {
+    await page.setViewportSize({ width, height });
+    await page.getByRole('button', { name: 'Open agents', exact: true }).click();
+    const drawer = page.getByTestId('left-drawer');
+    await expect(drawer).toBeVisible();
+    const content = drawer.locator('.drawer-content');
+    const contentBox = await content.boundingBox();
+    expect.soft(contentBox?.height ?? 0, `${width}x${height} keeps a readable drawer content area, not a thin slit`).toBeGreaterThanOrEqual(minContent);
+    expect.soft(await content.evaluate(element => element.scrollWidth <= element.clientWidth + 1), `${width}x${height} creates no horizontal drawer overflow`).toBe(true);
+    expect.soft(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1), `${width}x${height} creates no horizontal page scroll`).toBe(true);
+    // The footer's "Local monitoring uses zero AI calls" line is an Economy-relevant fact: it survives
+    // at ordinary laptop heights (960x540) and only disappears below the narrower 420px threshold.
+    expect.soft(await drawer.locator('.drawer-footer').isVisible(), `${width}x${height} zero-AI footer visibility follows the 420px threshold`).toBe(height > 420);
+
+    if (width === 960) {
+      // A non-modal drawer at this width must not cover the top bar: brand and workspace pill stay clickable.
+      for (const selector of ['.brand-mark', '.workspace-pill']) {
+        const reachable = await page.locator(selector).first().evaluate(element => {
+          const rect = element.getBoundingClientRect();
+          const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+          return !!hit && (element === hit || element.contains(hit));
+        });
+        expect.soft(reachable, `${selector} stays clickable behind the drawer at 960x540`).toBe(true);
+      }
+    }
+    await page.screenshot({ path: testInfo.outputPath(`short-${width}x${height}-agents.png`) });
+
+    // Tab reaches every drawer control and keeps it inside the visible viewport (scrolled into view)
+    // rather than clipped above or below the drawer's own short box.
+    const tabStops = await drawer.locator('button, input, a[href]').count();
+    await drawer.locator('.drawer-header .icon-button').focus();
+    for (let i = 0; i < tabStops; i++) {
+      await page.keyboard.press('Tab');
+      const stillInDrawer = await drawer.evaluate(element => element.contains(document.activeElement));
+      if (!stillInDrawer) break;
+      const withinViewport = await page.evaluate(() => {
+        const element = document.activeElement as HTMLElement;
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && rect.top >= -1 && rect.bottom <= innerHeight + 1;
+      });
+      expect.soft(withinViewport, `${width}x${height} tab stop ${i} scrolls fully into view`).toBe(true);
+    }
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(150);
+  }
+  expect(fixture.errors).toEqual([]); expect(fixture.unexpected).toEqual([]); expect(fixture.mutations).toEqual([]);
+});
+
+test('short and zoomed viewports keep the List heading, three rows and navigation clear of the pill and top bar', async ({ page }, testInfo) => {
+  const fixture = await uiFixture(page);
+  const original = fixture.snapshot.state.agents[0]!;
+  fixture.snapshot.state.agents = Array.from({ length: 6 }, (_, index) => ({ ...original, id: `audit-worker-${index}`, name: `Audit worker ${index}` }));
+
+  for (const { width, height } of SHORT_VIEWPORTS) {
+    // A fresh navigation per size (rather than resizing one live page across unrelated widths and
+    // heights) avoids Chrome's scroll-anchoring carrying an old scroll offset into the next viewport,
+    // which is not what a person opening the List view at that size would ever see.
+    await page.setViewportSize({ width, height });
+    await ready(page);
+    await page.getByRole('button', { name: 'Show list view', exact: true }).click();
+    const list = page.getByRole('region', { name: 'Accessible town list', exact: true });
+    await expect(list).toBeVisible();
+    const metrics = await page.evaluate(() => {
+      const layout = document.querySelector('.list-layout')!.getBoundingClientRect();
+      const topbar = document.querySelector('.topbar')!.getBoundingClientRect();
+      const pill = document.querySelector('.connection-pill')!.getBoundingClientRect();
+      const listView = document.querySelector('.list-view')!.getBoundingClientRect();
+      const heading = document.querySelector('.list-heading h1')!.getBoundingClientRect();
+      return {
+        underTopbar: layout.top < topbar.bottom,
+        underPill: layout.bottom > pill.top,
+        // Full containment (top AND bottom) inside .list-view's own box, not just the top edge: a heading
+        // whose top peeks just inside the scroll container while its bottom is clipped by that container's
+        // own overflow:auto (only the tops of its letters showing) must fail here, not read as "visible".
+        headingVisible: heading.height > 0 && heading.width > 0 && heading.top >= listView.top - 1 && heading.bottom <= listView.bottom + 1,
+        scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth,
+      };
+    });
+    expect.soft(metrics.underTopbar, `${width}x${height} List view never sits under the top bar`).toBe(false);
+    expect.soft(metrics.underPill, `${width}x${height} List view never sits under the connection pill`).toBe(false);
+    expect.soft(metrics.headingVisible, `${width}x${height} List heading stays visible`).toBe(true);
+    expect.soft(metrics.scrollWidth <= metrics.clientWidth + 1, `${width}x${height} creates no horizontal page scroll`).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath(`short-${width}x${height}-list-top.png`) });
+
+    // At least three rows exist and are reachable inside the List's own scrollable area (ACC: 640x360).
+    // A future fixture/filter change that drops below 3 real rows must fail here, not silently shrink
+    // the loop below and pass anyway.
+    const totalRows = await list.locator('tbody tr').count();
+    expect.soft(totalRows, `${width}x${height} List has at least 3 rows`).toBeGreaterThanOrEqual(3);
+    const rowCount = Math.min(3, totalRows);
+    for (let i = 0; i < rowCount; i++) {
+      const button = list.locator('tbody tr').nth(i).getByRole('button', { name: /^Inspect /, exact: false });
+      await button.scrollIntoViewIfNeeded();
+      const reachable = await button.evaluate(element => {
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+        return !!hit && (element === hit || element.contains(hit));
+      });
+      expect.soft(reachable, `${width}x${height} row ${i} stays reachable inside the List`).toBe(true);
+    }
+    await page.screenshot({ path: testInfo.outputPath(`short-${width}x${height}-list.png`) });
+  }
   expect(fixture.errors).toEqual([]); expect(fixture.unexpected).toEqual([]); expect(fixture.mutations).toEqual([]);
 });

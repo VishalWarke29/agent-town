@@ -1,7 +1,8 @@
 import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { isAbsolute, parse, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, parse, relative, resolve, sep } from 'node:path';
+import { EXCLUDED_DIRECTORIES } from './policy';
 import { DiscoveryError } from './types';
 
 export const pathKey = (value: string) => process.platform === 'win32' ? value.toLowerCase() : value;
@@ -9,6 +10,53 @@ export const pathKey = (value: string) => process.platform === 'win32' ? value.t
 export function isWithin(root: string, candidate: string): boolean {
   const remainder = relative(pathKey(root), pathKey(candidate));
   return remainder === '' || (!isAbsolute(remainder) && remainder !== '..' && !remainder.startsWith(`..${sep}`));
+}
+
+const sameOrAncestor = (parent: string, candidate: string) => pathKey(parent) === pathKey(candidate) || isWithin(parent, candidate);
+
+/** An absolute path from a real Windows environment variable, or undefined when unset/relative
+ * (never thrown on — a missing variable simply skips that one protected-location check). */
+function envPath(name: string): string | undefined {
+  const value = process.env[name];
+  return value && isAbsolute(value) ? resolve(value) : undefined;
+}
+
+/**
+ * One safe-root check for every folder the user gives Agent Town: `/roots`, `/projects/local`, the
+ * folder picker and the multi-project list all resolve through canonicalizeRoot (and, defensively,
+ * inspectLocalProject) before a folder becomes a discovery root or a connected project.
+ *
+ * Refuses Windows system and installed-application folders, the Users folder and other accounts'
+ * profiles (a subfolder of the CURRENT account's own profile is still allowed), AppData folders,
+ * Agent Town's own private data folder (its default location under %LOCALAPPDATA%, and any
+ * AGENT_TOWN_DATA_DIR override), and a folder whose own name is reserved for build/dependency/tool
+ * output (EXCLUDED_DIRECTORIES, which otherwise only prunes children during a scan).
+ *
+ * Windows-only: these are Windows-specific locations, and canonicalizeRoot's existing drive-root,
+ * exact-home-folder and no-symlink checks already apply on every platform.
+ */
+export function assertSafeProjectRoot(canonical: string): void {
+  if (process.platform !== 'win32') return;
+  const windowsDirectory = envPath('WINDIR') ?? envPath('SystemRoot');
+  if (windowsDirectory && sameOrAncestor(windowsDirectory, canonical)) throw new DiscoveryError('system-root');
+  for (const name of ['ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432', 'ProgramData']) {
+    const directory = envPath(name);
+    if (directory && sameOrAncestor(directory, canonical)) throw new DiscoveryError('program-files-root');
+  }
+  const home = resolve(homedir());
+  const usersRoot = resolve(dirname(home));
+  if (pathKey(canonical) === pathKey(usersRoot)) throw new DiscoveryError('user-profile-root');
+  if (isWithin(usersRoot, canonical) && !sameOrAncestor(home, canonical)) throw new DiscoveryError('other-profile-root');
+  const appData = envPath('APPDATA');
+  if (appData && pathKey(canonical) === pathKey(appData)) throw new DiscoveryError('app-data-root');
+  const localAppData = envPath('LOCALAPPDATA');
+  if (localAppData) {
+    if (pathKey(canonical) === pathKey(localAppData)) throw new DiscoveryError('app-data-root');
+    if (sameOrAncestor(resolve(localAppData, 'AgentTown'), canonical)) throw new DiscoveryError('agent-town-data-root');
+  }
+  const townData = envPath('AGENT_TOWN_DATA_DIR');
+  if (townData && sameOrAncestor(townData, canonical)) throw new DiscoveryError('agent-town-data-root');
+  if (EXCLUDED_DIRECTORIES.has(basename(canonical).toLowerCase())) throw new DiscoveryError('excluded-name-root');
 }
 
 function isLocalPath(value: string): boolean {
@@ -36,6 +84,7 @@ export async function canonicalizeRoot(input: string): Promise<string> {
     if (!(await lstat(candidate)).isDirectory()) throw new DiscoveryError('unavailable-root');
     const canonical = await realpath(candidate);
     if (!isLocalPath(canonical)) throw new DiscoveryError('unsafe-root');
+    assertSafeProjectRoot(canonical);
     return canonical;
   } catch (error) {
     if (error instanceof DiscoveryError) throw error;

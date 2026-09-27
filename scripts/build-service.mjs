@@ -1,8 +1,9 @@
 import { build } from 'esbuild';
 import { fileURLToPath } from 'node:url';
 import { copyFile, readFile, readdir, writeFile } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { renameWithRetry } from './atomic-write.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const hash = createHash('sha256');
@@ -25,12 +26,22 @@ await build({
   alias: { '@agent-town/contracts': `${root}/packages/contracts/src/index.ts` },
   define: { __AGENT_TOWN_BUILD__: JSON.stringify(buildInfo) },
 });
+// A hook can spawn the bridge at any moment, including mid-build; write the new bundle beside the
+// live one and rename it in — a rename is atomic, so a concurrent reader always sees the whole old
+// file or the whole new one, never a partial write — with a short retry for a transient Windows lock.
+const bridgeTemporary = `${root}/apps/service/dist/hook-bridge.cjs.tmp-${randomUUID()}`;
 await build({
   entryPoints: [`${root}/apps/service/src/observation/bridge.ts`],
-  outfile: `${root}/apps/service/dist/hook-bridge.cjs`,
+  outfile: bridgeTemporary,
   bundle: true, platform: 'node', format: 'cjs', target: 'node24', packages: 'external',
   alias: { '@agent-town/contracts': `${root}/packages/contracts/src/index.ts` },
 });
+await renameWithRetry(bridgeTemporary, `${root}/apps/service/dist/hook-bridge.cjs`);
+// Stamped with the same buildId as the running service (WS3-24), so the service can tell a rebuilt
+// bridge on disk apart from the one it started with and say so, instead of a silent version skew.
+const bridgeManifestTemporary = `${root}/apps/service/dist/hook-bridge-build.json.tmp-${randomUUID()}`;
+await writeFile(bridgeManifestTemporary, JSON.stringify(buildInfo));
+await renameWithRetry(bridgeManifestTemporary, `${root}/apps/service/dist/hook-bridge-build.json`);
 await copyFile(`${root}/apps/service/src/runner/claude-worker.mjs`, `${root}/apps/service/dist/claude-worker.mjs`);
 await copyFile(`${root}/apps/service/src/native-discovery/metadata-worker.mjs`, `${root}/apps/service/dist/metadata-worker.mjs`);
 await build({

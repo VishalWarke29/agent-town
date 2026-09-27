@@ -10,8 +10,9 @@ import { checkedPath, isWithin } from '../discovery/paths.js';
 import { acquireDataDirectoryLock, OperationsError, safeLocalDirectory } from './lock.js';
 import { projectRoot } from '../store.js';
 import { backupCoverage, validBackupCoverage, type BackupCoverage } from './coverage.js';
+import { tablesRequiredAtVersion, WORKSPACE_SCHEMA_VERSION_NUMBERS } from '../storage-registry.js';
 
-type Kind = 'identity' | 'workspace' | 'observation' | 'telemetry';
+export type Kind = 'identity' | 'workspace' | 'observation' | 'telemetry';
 export interface BackupManifest {
   format: 'agent-town-backup'; version: 1; createdAt: string;
   workspaces: { id: string; ownerId: string }[];
@@ -42,6 +43,21 @@ const allowedColumns: Record<string, string[]> = {
   observation_connections: ['id', 'workspace_id', 'owner_id', 'repo_path', 'token_hash', 'revoked', 'data'],
   telemetry_sources: ['id', 'owner_id', 'workspace_id', 'token_hash', 'revoked', 'data'],
 };
+/**
+ * Read-only view of the backup schema allowlist (WS8-13). openValidated rejects
+ * any table or column not listed here with 'unsupported-schema' (see below), so
+ * a migration that adds a table or column without updating this allowlist makes
+ * every future backup of that database unrestorable. tests/unit/backup-schema-parity.test.ts
+ * checks this allowlist against the migrated schema on every test run.
+ * Returns copies: callers (tests, diagnostics) cannot mutate the live allowlist.
+ */
+export function describeBackupAllowlist(): { allowedTables: Record<Kind, Set<string>>; allowedColumns: Record<string, string[]>; primaryTable: Record<Kind, string> } {
+  return {
+    allowedTables: Object.fromEntries(Object.entries(allowedTables).map(([kind, set]) => [kind, new Set(set)])) as Record<Kind, Set<string>>,
+    allowedColumns: Object.fromEntries(Object.entries(allowedColumns).map(([table, columns]) => [table, [...columns]])),
+    primaryTable: { ...primaryTable },
+  };
+}
 const digest = (value: Buffer) => createHash('sha256').update(value).digest('hex');
 const validId = (value: unknown): value is string => typeof value === 'string' && /^[a-zA-Z0-9-]{8,100}$/u.test(value);
 const validOwner = (value: unknown): value is string => typeof value === 'string' && /^[1-9][0-9]{0,19}$/u.test(value);
@@ -92,9 +108,9 @@ function openValidated(path: string | Buffer, kind: Kind, workspaceId?: string, 
       const expected = allowedColumns[table.name];
       if (!expected || columns.length !== expected.length || columns.some(column => column.hidden !== 0 || !expected.includes(column.name))) throw new OperationsError('unsupported-schema');
     }
-    const version = database.pragma('user_version', { simple: true });
-    if (kind === 'workspace' ? version !== 0 && version !== 2 && version !== 3 && version !== 4 : kind === 'identity' ? version !== 1 : version !== 0) throw new OperationsError('unsupported-schema');
-    if (kind === 'workspace' && (version === 3 || version === 4) && ['agent_archive', 'repository_archive', ...(version === 4 ? ['native_sources', 'native_sessions', 'native_session_aliases'] : [])].some(name => !schema.some(item => item.type === 'table' && item.name === name))) throw new OperationsError('unsupported-schema');
+    const version = database.pragma('user_version', { simple: true }) as number;
+    if (kind === 'workspace' ? !WORKSPACE_SCHEMA_VERSION_NUMBERS.includes(version) : kind === 'identity' ? version !== 1 : version !== 0) throw new OperationsError('unsupported-schema');
+    if (kind === 'workspace' && tablesRequiredAtVersion(version).some(name => !schema.some(item => item.type === 'table' && item.name === name))) throw new OperationsError('unsupported-schema');
     if (database.pragma('integrity_check', { simple: true }) !== 'ok') throw new OperationsError('invalid-backup');
     if (kind === 'identity') {
       const owners = database.prepare('SELECT id FROM identity_owners').all() as { id: string }[];
@@ -161,7 +177,7 @@ function restoredState(input: TownState, recoveredAt: string): TownState {
     if (agent.observation) agent.observation.freshness = 'stale';
   }
   if (state.workflow) {
-    state.workflow.policy.paidEnabled = false; state.workflow.manager.config.enabled = false;
+    state.workflow.policy.paidEnabled = false; state.workflow.manager.config.enabled = false; state.workflow.manager.config.automatic = false; state.workflow.manager.baselineAt = null;
     for (const connection of state.workflow.connections) connection.status = 'disconnected';
     for (const reservation of state.workflow.reservations) if (reservation.status === 'reserved') reservation.status = 'uncertain';
     for (const job of state.workflow.manager.jobs) if (job.status === 'running') { job.status = 'uncertain'; job.completedAt = recoveredAt; job.message = 'Backup recovery marked this request uncertain; this timestamp is recovery time, not provider completion. Reconcile usage before new work.'; }

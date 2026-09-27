@@ -22,6 +22,11 @@ export default defineConfig({
     url: 'http://127.0.0.1:4311/api/v1/health',
     reuseExistingServer: false,
     timeout: 20000,
-    env: { NODE_ENV: 'production', AGENT_TOWN_MODE: 'development', AGENT_TOWN_PORT: '4311', AGENT_TOWN_DATA_DIR: `.data/browser-tests/${Date.now()}` },
+    env: (() => {
+      const scratch = `.data/browser-tests/${Date.now()}`;
+      // Explicit, not just relied-on-by-fallback: a browser-test run must never touch the
+      // owner's real credential vault (%LOCALAPPDATA%/AgentTownCredentials).
+      return { NODE_ENV: 'production', AGENT_TOWN_MODE: 'development', AGENT_TOWN_PORT: '4311', AGENT_TOWN_DATA_DIR: scratch, AGENT_TOWN_VAULT_DIR: `${scratch}/credentials` };
+    })(),
   },
 });

@@ -34,7 +34,7 @@ function emptyCoordination(snapshot: Snapshot): CoordinationPlan {
   return { schemaVersion: 1, advisoryOnly: true, inferenceCalls: 0, contextVersion: snapshot.state.manager.version, capacity: { limit, active: 0, available: limit }, tasks: [], suggestedTaskIds: [] };
 }
 
-test('pending subscription instructions resume after closing the panel without starting another login', async ({ page }) => {
+test('pending subscription instructions resume after closing the panel without starting another login', async ({ page }, testInfo) => {
   await installEventFixture(page);
   const snapshot = emptySnapshot('resume-workspace', 'Sign-in recovery');
   snapshot.state.workflow = { schemaVersion: 1, connections: [], defaults: {}, policy: { paidEnabled: false, dailyBudgetMicroUsd: 0, managerDailyBudgetMicroUsd: 0, maxRunBudgetMicroUsd: 0, workerConcurrency: 1, timeZone: 'UTC' }, reservations: [], manager: { config: { enabled: false, connectionId: null, model: null, maxInputTokens: 4096, maxOutputTokens: 800, requestBudgetMicroUsd: 0 }, queueReportIds: [], jobs: [], versions: [], proposals: [], automaticStarts: [] } };
@@ -65,6 +65,11 @@ test('pending subscription instructions resume after closing the panel without s
   await page.getByRole('button', { name: 'Resume sign-in', exact: true }).click();
   await expect(page.getByText('FIXTURE-ONLY-CODE', { exact: true })).toBeVisible();
   await expect(page.getByRole('link', { name: 'Open OpenAI sign-in', exact: true })).toHaveAttribute('href', 'https://auth.openai.com/codex/device');
+  // UX-33: the frozen Codex subscription sign-in screen shows the same sign-in code warning while it exists.
+  const codexWarning = page.getByText('Only enter this code if you started sign-in here just now.', { exact: false });
+  await expect(codexWarning).toBeVisible();
+  await codexWarning.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: `docs/assets/previews/codex-sign-in-code-warning-${testInfo.project.name}.png`, animations: 'disabled' });
   expect(reads).toBeGreaterThanOrEqual(2); expect(mutations).toEqual([]);
   expect(await page.evaluate(() => JSON.stringify({ ...localStorage }) + JSON.stringify({ ...sessionStorage }))).not.toContain('FIXTURE-ONLY-CODE');
 });
@@ -108,9 +113,9 @@ test('private repository selection shows real metadata and clears it on workspac
   await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Run demo', exact: true })).toHaveCount(0);
   await expect(page.getByText('Milo', { exact: true })).toHaveCount(0);
-  await page.getByRole('button', { name: 'Connect repositories', exact: true }).click();
-  await page.getByLabel('Selected parent folder', { exact: true }).fill(String.raw`C:\fixture-projects`);
-  await page.getByRole('button', { name: 'Add selected folder', exact: true }).click();
+  await page.getByRole('button', { name: 'Connect a project', exact: true }).click();
+  await page.getByLabel('Project folder', { exact: true }).fill(String.raw`C:\fixture-projects`);
+  await page.getByRole('button', { name: 'Add this project', exact: true }).click();
   await expect.poll(() => mutations.length).toBe(1);
   expect(mutations[0]?.body).toEqual({ path: String.raw`C:\fixture-projects` });
   first.state.discovery!.roots = [String.raw`C:\fixture-projects`];
@@ -152,6 +157,40 @@ test('private repository selection shows real metadata and clears it on workspac
   await expect(page.getByText('feature/private', { exact: true })).toHaveCount(0);
 });
 
+// UX-05 (Gap 8): "Show welcome tips" only ever reopened the sample town's own dismissible intro card
+// (App.tsx's `demo && ... !hintDismissed` world-intro), which a private workspace never renders — pressing
+// it here silently did nothing. It must not be offered where it has no real tip to reopen.
+test('Show welcome tips is not offered in a private workspace, where it has no real tip to reopen', async ({ page }) => {
+  await installEventFixture(page);
+  const snapshot = emptySnapshot('tips-workspace', 'Tips workspace');
+  const session: BrowserSession = { csrf: 'fixture-tips-csrf', mode: 'private', user: { id: 'fixture-tips-owner', login: 'fixture-tips-owner', displayName: null, avatarUrl: null }, workspaces: [{ id: 'tips-workspace', name: 'Tips workspace', kind: 'personal' }], identity: { configured: true } };
+  await page.route('**/api/v1/session', route => route.fulfill({ json: session }));
+  await page.route('**/api/v1/workspaces/tips-workspace/snapshot', route => route.fulfill({ json: snapshot }));
+  await page.goto('/');
+  await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Show welcome tips', exact: true })).toHaveCount(0);
+});
+
+// UX-02: the same qualified privacy sentences (PRIVACY_COPY) must still appear once signed in, since the
+// heading that carries them renders regardless of sign-in state. The old unqualified "sends no project
+// files or agent activity to GitHub or any AI provider" (removed: false once the manager or a managed
+// task runs, SP-3/SH-1) must not be present either way.
+test('the Connections drawer states exactly when data leaves this computer once signed in', async ({ page }) => {
+  await installEventFixture(page);
+  const snapshot = emptySnapshot('privacy-workspace', 'Privacy workshop');
+  await routeTasksWorkspace(page, snapshot, []);
+  await page.goto('/');
+  await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Open connections', exact: true }).click();
+  const setup = page.getByRole('region', { name: 'Private workspace setup', exact: true });
+  await expect(setup.getByText('Signed in as', { exact: false })).toBeVisible();
+  await expect(setup).toContainText('Report text reaches an AI provider only when you press Process, or automatically every 30 seconds if you turn that on.');
+  await expect(setup).toContainText('A managed task sends its files and output to an AI provider only once you approve that task.');
+  await expect(setup).toContainText('AI credits are used only if you turn on the manager and allow paid work, then either press Process or turn on automatic processing.');
+  await expect(setup).not.toContainText('sends no project files or agent activity');
+});
+
 test('GitHub device sign-in shows the verified destination and supports cancellation', async ({ page }) => {
   await installEventFixture(page);
   let cancelled = false;
@@ -167,7 +206,8 @@ test('GitHub device sign-in shows the verified destination and supports cancella
   await page.getByRole('button', { name: 'Open connections', exact: true }).click();
   await page.getByRole('button', { name: 'Sign in with GitHub', exact: true }).click();
   await expect(page.getByText('ABCD-EFGH', { exact: true })).toBeVisible();
-  await expect(page.getByRole('link', { name: 'Open GitHub', exact: true })).toHaveAttribute('href', 'https://github.com/login/device');
+  await expect(page.getByRole('link', { name: 'Open GitHub', exact: true })).toHaveAttribute('href', 'https://github.com/login/device?user_code=ABCD-EFGH');
+  await expect(page.getByRole('button', { name: 'Copy code', exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Cancel sign-in', exact: true }).click();
   await expect(page.getByText('Sign-in cancelled.', { exact: true })).toBeVisible();
   expect(cancelled).toBe(true);
@@ -185,16 +225,21 @@ test('a completed authorization is reconciled when it wins a cancellation race',
   await page.route('**/api/v1/auth/github/device/start', route => route.fulfill({ json: { flowId: 'race-flow', userCode: 'RACE-CODE', verificationUri: 'https://github.com/login/device', expiresAt: new Date(Date.now() + 600000).toISOString(), intervalSeconds: 5 } }));
   await page.route('**/api/v1/auth/github/device/cancel', async route => { authorized = true; await route.fulfill({ status: 403, json: { message: 'The previous CSRF value expired.' } }); });
   await page.goto('/?preview=1');
-  await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
+  await expect(page.getByText('Sample town · local service connected', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Open connections', exact: true }).click();
   await page.getByRole('button', { name: 'Sign in with GitHub', exact: true }).click();
   await expect(page.getByText('RACE-CODE', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Cancel sign-in', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'Create your workspace', exact: true })).toBeVisible();
+  // The reconciliation notice is set inside cancelSignIn() itself, the moment the cancel call
+  // resolves and refreshSession() sees a user — it does not depend on any further click. WS1-02
+  // collapsed the old two-step "outer CTA opens the form" flow into landing on the create-workspace
+  // form directly, so its submit button (real, name-gated, and no longer a same-named no-op reveal
+  // action) must stay unclicked here — this test is about the notice/session surviving the race, not
+  // about actually creating a workspace.
+  await expect(page.getByText('GitHub authorization completed before cancellation. Use Sign out to close that session.', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Create workspace', exact: true })).toBeVisible();
   expect(new URL(page.url()).searchParams.has('preview')).toBe(false);
   await expect(page.getByRole('button', { name: 'Run demo', exact: true })).toHaveCount(0);
-  await page.getByRole('button', { name: 'Create your workspace', exact: true }).click();
-  await expect(page.getByText('GitHub authorization completed before cancellation. Use Sign out to close that session.', { exact: true })).toBeVisible();
   await expect(page.getByText('Race owner', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Sign out of GitHub', exact: true })).toBeEnabled();
 });
@@ -212,6 +257,7 @@ test('observation setup distinguishes event receipt from verification and task a
     await route.fulfill({ response: upstream, json: { ...body, mode: 'private', user: { id: 'observed-owner', login: 'fixture-owner', displayName: null, avatarUrl: null }, workspaces: [{ id: 'observed-workspace', name: 'Observation workshop', kind: 'personal' }] } });
   });
   await page.route('**/api/v1/workspaces/observed-workspace/snapshot', route => route.fulfill({ json: snapshot }));
+  await page.route(/\/api\/v1\/workspaces\/observed-workspace\/agents\/[^/]+\/reports/, route => route.fulfill({ json: { reports: [], reportCount: 0, reportsNextOffset: null } }));
   await page.route('**/api/v1/workspaces/observed-workspace/observation/native-setup?**', async route => { expect(route.request().method()).toBe('GET'); await route.fulfill({ json: { sources: [], tools: [] } }); });
   await page.route('**/api/v1/workspaces/observed-workspace/observation/connections', async route => {
     expect(route.request().postDataJSON()).toEqual({ provider: 'codex', repoId: 'observed-repo', label: 'My observed Codex' });
@@ -228,6 +274,10 @@ test('observation setup distinguishes event receipt from verification and task a
   await page.goto('/');
   await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Open connections', exact: true }).click();
+  // H0-09: the manual form no longer mounts (and reads no native-setup) just from opening Connections; it opens on request.
+  await page.getByRole('button', { name: 'Set up tracking', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Agent tool', exact: true }).selectOption('codex');
+  await page.getByRole('combobox', { name: 'Repository for observation', exact: true }).selectOption('observed-repo');
   await page.getByLabel('Connection label', { exact: true }).fill('My observed Codex');
   await page.getByRole('button', { name: 'Prepare observation setup', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'Proposed hook configuration', exact: true })).toHaveValue('{ "hooks": {} }');
@@ -252,7 +302,7 @@ test('observation setup distinguishes event receipt from verification and task a
   await publish();
   await expect(page.getByTestId('right-drawer')).toContainText('Response finished');
   await expect(page.getByTestId('right-drawer')).toContainText('Last reported · stale');
-  await expect(page.getByTestId('right-drawer')).toContainText('Last reported · check the native tool');
+  await expect(page.getByTestId('right-drawer').getByRole('button', { name: 'Review activity tracking', exact: true })).toBeVisible();
   await expect(page.getByTestId('right-drawer')).toContainText('does not accept a task');
   await expect(page.getByTestId('right-drawer').getByText('Awaiting review', { exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: 'Close details', exact: true }).click();
@@ -296,8 +346,8 @@ test('API credentials clear after verification and paid manager controls require
   await page.getByRole('button', { name: 'Close details', exact: true }).click();
   await page.getByRole('button', { name: 'Open connections', exact: true }).click();
   const claudeSetup = page.getByRole('region', { name: 'Claude subscription setup', exact: true });
-  await expect(claudeSetup).toContainText('In-app Claude subscription sign-in is not available yet.');
-  await expect(claudeSetup).toContainText('Scroll down in Connections');
+  await expect(claudeSetup).toContainText('Agent Town does not offer Claude sign-in: sign in inside Claude Code.');
+  await expect(claudeSetup).not.toContainText('Scroll down in Connections');
   await claudeSetup.scrollIntoViewIfNeeded();
   await page.screenshot({ path: `docs/assets/previews/account-subscriptions-${testInfo.project.name}.png`, animations: 'disabled' });
   await page.getByRole('button', { name: 'API credits', exact: true }).click();
@@ -342,11 +392,18 @@ test('API credentials clear after verification and paid manager controls require
   await page.getByLabel('My quality-check evidence', { exact: true }).fill('Browser fixture attestation; no real model was evaluated.');
   await page.getByRole('checkbox', { name: 'I checked this model against the quality needed for these summaries', exact: true }).check();
   await page.getByLabel('Manager per-request limit (USD)', { exact: true }).fill('0.025');
-  await page.getByRole('checkbox', { name: 'Enable automatic manager summaries using this account and these limits', exact: true }).check();
-  await page.getByRole('button', { name: 'Enable manager with these limits', exact: true }).click();
+  await page.getByRole('checkbox', { name: 'Turn on the manager with this account and these limits', exact: true }).check();
+  await page.getByRole('button', { name: 'Save manager settings', exact: true }).click();
   await expect.poll(() => requests.length).toBe(3);
   expect(requests[2]).toMatchObject({ method: 'PATCH', body: { enabled: true, connectionId: 'fixture-api', requestBudgetMicroUsd: 25000, model: { model: 'fixture-economy-model', qualityStatus: 'user-attested', inputPerMillionMicroUsd: 1000000 } } });
   workflow.manager.config = requests[2]!.body as ManagerConfig; await publish();
+  // UX-02: the Manager status line reads the saved config through the shared managerStatusLine helper.
+  const managerStatusText = page.getByText('explicit only', { exact: false });
+  await expect(managerStatusText).toBeVisible();
+  // Scroll the line itself into view so the saved screenshot actually shows the sentence being asserted
+  // above, rather than whatever the drawer happened to be scrolled to after filling the settings form.
+  await managerStatusText.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: `docs/assets/previews/manager-status-line-${testInfo.project.name}.png`, animations: 'disabled' });
   await page.getByRole('button', { name: 'Process saved reports · paid', exact: true }).click();
   await expect.poll(() => requests.length).toBe(4);
   expect(requests[3]).toMatchObject({ path: '/api/v1/workspaces/budget-workspace/manager/process', method: 'POST', body: {} });
@@ -513,6 +570,7 @@ test('managed task drafts require execution checks, exact approval, and separate
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith('/snapshot')) { await route.fulfill({ json: snapshot }); return; }
     if (path.endsWith('/coordination')) { expect(route.request().method()).toBe('GET'); await route.fulfill({ json: emptyCoordination(snapshot) }); return; }
+    if (/\/agents\/[^/]+\/reports$/.test(path) && route.request().method() === 'GET') { await route.fulfill({ json: { reports: [], reportCount: 0, reportsNextOffset: null } }); return; }
     if (path.endsWith('/runner/preflight')) { expect(route.request().postDataJSON()).toEqual({ tool: 'openai-api', repoId: 'runner-repo' }); await route.fulfill({ json: { tool: 'openai-api', ready: preflightReady, checkedAt: new Date().toISOString(), checks: [{ name: 'Fixture sandbox boundary', passed: preflightReady, message: preflightReady ? 'Fixture execution check passed.' : 'Fixture execution boundary unavailable.' }] } }); return; }
     if (path.endsWith('/tasks')) draft = route.request().postDataJSON() as CreateRunDraft;
     if (path.endsWith('/approve')) approvals.push(route.request().postDataJSON());
@@ -618,3 +676,408 @@ test('managed task drafts require execution checks, exact approval, and separate
   await page.screenshot({ path: testInfo.outputPath('native-task-approval.png') });
   expect(approvals).toHaveLength(1);
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// CH-02 (the Tasks drawer stops guessing, keeps what you typed and says why nothing can start) and UX-03 (signing out or
+// switching account clears everything private on screen). One draft store (apps/web/src/draftStore.ts) keeps the typed text
+// outside App's state; resetPrivateState() clears it for sign-out, an account change and a workspace change, and keeps it,
+// hidden, when a session simply expires (decision D72). Fixtures only: no real account, service data or model is involved.
+// ---------------------------------------------------------------------------------------------------------------------
+
+function gitProject(id: string, name: string, slot: number): Repository {
+  return { id, name, description: 'Local checkout', language: 'TypeScript', branch: 'main', position: [-6 + slot * 4, -4], color: '#6c8c91', source: 'local', localPath: `C:\\fixture\\${id}` };
+}
+
+function taskWorkflow(withAccount: boolean, proposals: WorkflowState['manager']['proposals'] = []): WorkflowState {
+  return { schemaVersion: 1, connections: withAccount ? [{ id: 'worker-api', provider: 'openai', mode: 'api', label: 'Fixed worker account', status: 'verified', createdAt: '2026-09-14T12:00:00Z', verifiedAt: '2026-09-14T12:00:00Z', accountIdentity: 'unavailable', models: ['gpt-5.4-mini-2026-03-17'], capabilities: { manager: true, managedExecution: true } }] : [],
+    defaults: withAccount ? { 'openai:api': 'worker-api' } : {}, policy: { paidEnabled: false, dailyBudgetMicroUsd: 0, managerDailyBudgetMicroUsd: 0, maxRunBudgetMicroUsd: 0, workerConcurrency: 1, timeZone: 'UTC' }, reservations: [],
+    manager: { config: { enabled: false, connectionId: null, model: null, maxInputTokens: 4096, maxOutputTokens: 800, requestBudgetMicroUsd: 0 }, queueReportIds: [], jobs: [], versions: [], proposals, automaticStarts: [] } };
+}
+
+/** A private workspace whose only writes are the ones a test lists: the check is blocked, and anything else is refused. */
+async function routeTasksWorkspace(page: Page, snapshot: Snapshot, writes: { path: string; body: unknown }[]) {
+  const id = snapshot.state.workspace.id;
+  await page.route('**/api/v1/session', async route => {
+    const upstream = await route.fetch(); const body = await upstream.json();
+    await route.fulfill({ response: upstream, json: { ...body, mode: 'private', user: { id: 'tasks-owner', login: 'fixture-owner', displayName: null, avatarUrl: null }, workspaces: [{ id, name: snapshot.state.workspace.name, kind: 'personal' }] } });
+  });
+  await page.route(`**/api/v1/workspaces/${id}/**`, async route => {
+    const path = new URL(route.request().url()).pathname, method = route.request().method();
+    if (path.endsWith('/snapshot')) { await route.fulfill({ json: snapshot }); return; }
+    if (path.endsWith('/coordination')) { await route.fulfill({ json: emptyCoordination(snapshot) }); return; }
+    if (/\/agents\/[^/]+\/reports$/.test(path) && method === 'GET') { await route.fulfill({ json: { reports: [], reportCount: 0, reportsNextOffset: null } }); return; }
+    if (path.endsWith('/runner/preflight')) {
+      const body = route.request().postDataJSON() as { tool: string; repoId: string };
+      writes.push({ path, body });
+      await route.fulfill({ json: { tool: body.tool, ready: false, checkedAt: new Date().toISOString(), checks: [{ name: 'Fixture sandbox boundary', passed: false, message: 'Fixture execution boundary unavailable.' }, { name: 'Fixture transport', passed: true, message: 'Fixture transport is fine.' }] } }); return;
+    }
+    if (method !== 'GET') writes.push({ path, body: route.request().postDataJSON() });
+    await route.fulfill({ status: 404, json: { message: 'Unsupported fixture request.' } });
+  });
+}
+
+async function openTasks(page: Page) { await page.getByRole('button', { name: 'Open tasks', exact: true }).click(); }
+const workspacePublisher = (page: Page, snapshot: Snapshot) => async () => { snapshot.cursor++; await page.evaluate(value => window.dispatchEvent(new CustomEvent('fixture-workspace-state', { detail: value })), snapshot); };
+
+test('the Tasks form never guesses the project, keeps what you typed through Escape, Close and a resize, and leads a blocked check with a plain sentence', async ({ page }, testInfo) => {
+  await installEventFixture(page);
+  const snapshot = emptySnapshot('tasks-workspace', 'Tasks workshop');
+  snapshot.state.repositories = [gitProject('billing-repo', 'Billing project', 0), gitProject('search-repo', 'Search project', 1)];
+  snapshot.state.workflow = taskWorkflow(true);
+  const writes: { path: string; body: unknown }[] = [];
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await routeTasksWorkspace(page, snapshot, writes);
+  await page.goto('/');
+  await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
+  await openTasks(page);
+  await expect(page.getByRole('heading', { name: 'Managed tasks', exact: true })).toBeVisible();
+  await expect(page.getByText('The check starts no task and makes no model request; it may run local sandbox probes.', { exact: true })).toBeVisible();
+
+  // Nothing is pre-selected when there is a choice (D38): a blank form starts on "Choose a project".
+  await page.getByText('Prepare a new task', { exact: true }).click();
+  const project = page.getByRole('combobox', { name: 'Task repository', exact: true });
+  const objective = page.getByRole('textbox', { name: 'Task objective', exact: true });
+  const criteria = page.getByRole('textbox', { name: 'Acceptance criteria (one per line)', exact: true });
+  await expect(project).toHaveValue('');
+  await expect(project.locator('option:checked')).toHaveText('Choose a project');
+  await expect(project.locator('option')).toHaveText(['Choose a project', 'Billing project', 'Search project']);
+  await expect(page.getByRole('button', { name: 'Check execution requirements', exact: true })).toBeDisabled();
+
+  // Changing the project never remounts the form or clears what was typed.
+  await objective.fill('Add a retry to the search index job');
+  await criteria.fill('The job retries twice\nA failed retry is reported');
+  await objective.evaluate(element => { (element as HTMLTextAreaElement & { keptNode?: string }).keptNode = 'same textarea'; });
+  await project.selectOption('search-repo');
+  await expect(objective).toHaveValue('Add a retry to the search index job');
+  await expect(criteria).toHaveValue('The job retries twice\nA failed retry is reported');
+  expect(await objective.evaluate(element => (element as HTMLTextAreaElement & { keptNode?: string }).keptNode)).toBe('same textarea');
+  await expect(page.getByText('Kept in this browser tab only, not saved to disk. Signing out clears it.', { exact: true })).toBeVisible();
+  await criteria.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath('tasks-kept-text.png') });
+
+  const expectKept = async () => {
+    await expect(objective).toBeVisible(); // kept text opens the form on its own
+    await expect(objective).toHaveValue('Add a retry to the search index job');
+    await expect(criteria).toHaveValue('The job retries twice\nA failed retry is reported');
+    await expect(project).toHaveValue('search-repo');
+  };
+  // Escape, then Close, then a resize across the 900 px breakpoint: the text survives each one.
+  await page.keyboard.press('Escape');
+  await expect(page.getByTestId('left-drawer')).toHaveCount(0);
+  await openTasks(page); await expectKept();
+  await page.getByRole('button', { name: 'Close navigation', exact: true }).click();
+  await expect(page.getByTestId('left-drawer')).toHaveCount(0);
+  await openTasks(page); await expectKept();
+  const original = page.viewportSize()!;
+  await page.setViewportSize({ width: original.width >= 900 ? 700 : 1200, height: original.height });
+  await expectKept();
+  await page.setViewportSize(original);
+  await expectKept();
+
+  // A blocked check leads with a plain sentence, then lists the raw checks. Nothing starts and no draft is saved.
+  await page.getByRole('button', { name: 'Check execution requirements', exact: true }).click();
+  await expect(page.getByText('Execution is blocked', { exact: true })).toBeVisible();
+  const blocked = page.locator('.preflight-results');
+  await expect(blocked.getByText('Agent Town cannot run this task on this computer yet. No task was started and no model request was made. The checks below show what did not pass.', { exact: true })).toBeVisible();
+  expect(await blocked.evaluate(element => [...element.children].map(child => child.tagName))).toEqual(['STRONG', 'P', 'UL']);
+  await expect(blocked.getByText('Blocked · Fixture sandbox boundary', { exact: true })).toBeVisible();
+  await expect(blocked.getByText('Fixture execution boundary unavailable.', { exact: true })).toBeVisible();
+  await expect(blocked.getByText('Passed · Fixture transport', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Create reviewable task draft', exact: true })).toBeDisabled();
+  expect(writes.map(write => write.path.split('/').slice(-2).join('/'))).toEqual(['runner/preflight']);
+  expect(writes[0]?.body).toEqual({ tool: 'openai-api', repoId: 'search-repo' });
+  await blocked.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath('tasks-blocked.png') });
+  expect(errors).toEqual([]);
+});
+
+test('a Tasks panel with no eligible project or no account offers a working next step instead of only text', async ({ page }, testInfo) => {
+  await installEventFixture(page);
+  const snapshot = emptySnapshot('tasks-workspace', 'Tasks workshop');
+  snapshot.state.workflow = taskWorkflow(false);
+  const writes: { path: string; body: unknown }[] = [];
+  await routeTasksWorkspace(page, snapshot, writes);
+  const publish = workspacePublisher(page, snapshot);
+  await page.goto('/');
+  await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
+
+  // No project at all: the button opens the Repositories drawer.
+  await openTasks(page);
+  await expect(page.getByText('Connect a local Git repository before preparing a managed task.', { exact: true })).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('tasks-no-project.png') });
+  await page.getByRole('button', { name: 'Connect a project', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Repositories', level: 2 })).toBeVisible();
+  await expect(page.getByText('Connect a local Git repository before preparing a managed task.', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Repositories', exact: true })).toBeFocused(); // the button that was pressed is gone: focus stays in the drawer
+
+  // Only a plain folder (no Git history): the same next step, and the honest reason.
+  snapshot.state.repositories = [{ ...gitProject('plain-folder', 'Notes folder', 0), projectKind: 'folder', branch: 'Not applicable' }];
+  await publish();
+  await page.getByRole('button', { name: 'Tasks', exact: true }).click();
+  await expect(page.getByText(/Connected project folders support agent observation\. Managed tasks require an existing Git repository/)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Connect a project', exact: true })).toBeVisible();
+
+  // One Git project and no verified account: the project is selected (there is no choice to make), and the account gap has a button.
+  snapshot.state.repositories = [gitProject('only-repo', 'Only project', 0)];
+  await publish();
+  await expect(page.getByRole('button', { name: 'Connect a project', exact: true })).toHaveCount(0);
+  await page.getByText('Prepare a new task', { exact: true }).click();
+  const project = page.getByRole('combobox', { name: 'Task repository', exact: true });
+  await expect(project).toHaveValue('only-repo');
+  await expect(project.locator('option')).toHaveText(['Only project']);
+  await expect(page.getByRole('button', { name: 'Check execution requirements', exact: true })).toBeEnabled();
+  await expect(page.getByText('No verified account for this worker yet. Add one in Connections. Adding an account starts no task.', { exact: true })).toBeVisible();
+  await page.getByRole('combobox', { name: 'Managed worker tool', exact: true }).selectOption('codex');
+  await expect(page.getByText('No verified Codex subscription account yet. Add one in Connections. Adding an account starts no task.', { exact: true })).toBeVisible();
+  await page.getByRole('combobox', { name: 'Managed worker tool', exact: true }).selectOption('openai-api');
+  await page.getByRole('button', { name: 'Open Connections', exact: true }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath('tasks-no-account.png') });
+  await page.getByRole('button', { name: 'Open Connections', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Connections', level: 2 })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Connections', exact: true })).toBeFocused();
+
+  // Once an account is verified the notice is gone.
+  snapshot.state.workflow = taskWorkflow(true);
+  await publish();
+  await page.getByRole('button', { name: 'Tasks', exact: true }).click();
+  await page.getByText('Prepare a new task', { exact: true }).click();
+  await expect(page.getByRole('combobox', { name: 'Task billing connection', exact: true }).locator('option')).toHaveText(['Choose a verified connection', 'Fixed worker account · api']);
+  await expect(page.getByRole('button', { name: 'Open Connections', exact: true })).toHaveCount(0);
+  expect(writes).toEqual([]); // the buttons only navigate: no check, no draft, no request
+});
+
+test('typing in the Tasks draft does not redraw the 3D scene', async ({ page }) => {
+  // Counts commits in which the World component actually rendered, through React's own devtools hook (no change to the app).
+  // World is not memoized, so any App-level state change that a keystroke caused would redraw the whole scene (UX-23: 15.6 ms each).
+  await page.addInitScript(() => {
+    const counts = { world: 0 }; let domRenderer = -1, nextRenderer = 1;
+    (window as unknown as { __worldRenders: typeof counts }).__worldRenders = counts;
+    type Fiber = { flags: number; type: unknown; memoizedProps: Record<string, unknown> | null; child: Fiber | null; sibling: Fiber | null; alternate: Fiber | null };
+    // Like React DevTools: only subtrees whose first child changed were touched by this commit (flags on an untouched fiber are stale),
+    // and inside a touched subtree PerformedWork (flag 1) means the function component really rendered rather than bailed out.
+    const visit = (next: Fiber, prev: Fiber | null) => {
+      const props = next.memoizedProps;
+      if (typeof next.type === 'function' && props && 'snapshotGeneration' in props && 'labelsInteractive' in props && (!prev || (next.flags & 1) === 1)) counts.world++;
+      if (next.child !== (prev?.child ?? null)) for (let child = next.child; child; child = child.sibling) visit(child, child.alternate);
+    };
+    (window as unknown as { __REACT_DEVTOOLS_GLOBAL_HOOK__: unknown }).__REACT_DEVTOOLS_GLOBAL_HOOK__ = {
+      supportsFiber: true, isDisabled: false, renderers: new Map(),
+      inject(internals: { rendererPackageName?: string }) { const id = nextRenderer++; if (internals?.rendererPackageName === 'react-dom') domRenderer = id; return id; },
+      onCommitFiberRoot(id: number, root: { current: Fiber }) { if (id === domRenderer) visit(root.current, root.current.alternate); },
+      onCommitFiberUnmount() {}, onPostCommitFiberRoot() {}, checkDCE() {}, on() {}, off() {}, sub() { return () => {}; },
+    };
+  });
+  await installEventFixture(page);
+  const snapshot = emptySnapshot('tasks-workspace', 'Tasks workshop');
+  snapshot.state.repositories = [gitProject('billing-repo', 'Billing project', 0), gitProject('search-repo', 'Search project', 1)];
+  snapshot.state.workflow = taskWorkflow(true);
+  await routeTasksWorkspace(page, snapshot, []);
+  const publish = workspacePublisher(page, snapshot);
+  await page.goto('/');
+  await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
+  await openTasks(page);
+  await page.getByText('Prepare a new task', { exact: true }).click();
+  await expect(page.locator('canvas'), 'the 3D scene must be running for its redraws to be counted').toHaveCount(1);
+  const worldRenders = () => page.evaluate(() => (window as unknown as { __worldRenders: { world: number } }).__worldRenders.world);
+
+  // The counter must be able to see a redraw: a saved-state update from the service redraws the world.
+  const first = await worldRenders();
+  await publish();
+  await expect.poll(worldRenders).toBeGreaterThan(first);
+
+  const settled = await worldRenders();
+  await page.getByRole('textbox', { name: 'Task objective', exact: true }).pressSequentially('Typing a long objective must not redraw the world.');
+  await page.getByRole('textbox', { name: 'Acceptance criteria (one per line)', exact: true }).pressSequentially('First criterion\nSecond criterion\nThird criterion');
+  await page.getByRole('combobox', { name: 'Task repository', exact: true }).selectOption('billing-repo');
+  // Anything that redraws per keystroke adds one render for each of these ~90 keystrokes. The service-free 10 s clock tick can add one.
+  expect((await worldRenders()) - settled).toBeLessThanOrEqual(1);
+  await expect(page.getByRole('textbox', { name: 'Task objective', exact: true })).toHaveValue('Typing a long objective must not redraw the world.');
+});
+
+// UX-03: A leaves private work on screen, the person signs out (or the session ends, or the account flips), and B signs in in the same tab.
+type Who = 'a' | 'b' | 'nobody';
+type Actor = { user: NonNullable<BrowserSession['user']>; workspace: { id: string; name: string; kind: 'personal' }; snapshot: Snapshot };
+function accountActor(tag: 'a' | 'b'): Actor {
+  const upper = tag.toUpperCase();
+  const snapshot = emptySnapshot(`ws-${tag}`, `${upper} workspace`);
+  snapshot.state.repositories = [gitProject(`${tag}-repo`, `${upper} billing project`, 0)];
+  snapshot.state.workflow = taskWorkflow(true, tag === 'a' ? [{ id: 'proposal-a', sourceJobId: 'job-a', repoId: 'a-repo', title: 'A-PRIVATE rotate the Acme production credentials', acceptanceCriteria: ['A-PRIVATE criterion: the old credentials stop working'], status: 'proposed', createdAt: '2026-09-24T09:00:00Z' }] : []);
+  snapshot.state.agents = [{ id: `${tag}-worker`, name: `${upper} worker`, provider: 'Codex', role: 'Managed worker', repoId: `${tag}-repo`, task: `${upper} fixture task`, activity: 'idle', color: '#6c8c91', home: [-5.4, -0.5], updatedAt: '2026-09-24T09:00:00Z', files: [], evidence: 'Fixture agent', contextVersion: 0 }];
+  return { user: { id: `owner-${tag}`, login: `owner-${tag}`, displayName: `${upper} owner`, avatarUrl: null }, workspace: { id: `ws-${tag}`, name: `${upper} workspace`, kind: 'personal' }, snapshot };
+}
+
+async function routeAccounts(page: Page, actors: Record<'a' | 'b', Actor>, control: { who: Who; expired: boolean; signingInAs: Who; writes: string[] }) {
+  let base: BrowserSession | undefined;
+  const sessionFor = (who: Who): BrowserSession => ({ ...base!, mode: 'private', csrf: `csrf-${who}`, identity: { configured: true }, user: who === 'nobody' ? null : actors[who].user, workspaces: who === 'nobody' ? [] : [actors[who].workspace] });
+  await page.route('**/api/v1/**', async route => {
+    const path = new URL(route.request().url()).pathname, method = route.request().method();
+    if (path === '/api/v1/session') { const upstream = await route.fetch(); base = await upstream.json() as BrowserSession; await route.fulfill({ response: upstream, json: sessionFor(control.who) }); return; }
+    if (path === '/api/v1/auth/logout') { control.who = 'nobody'; await route.fulfill({ json: sessionFor('nobody') }); return; }
+    if (path === '/api/v1/auth/github/device/start') { await route.fulfill({ json: { flowId: 'flow-fixture', userCode: 'ABCD-EFGH', verificationUri: 'https://github.com/login/device', expiresAt: new Date(Date.now() + 600000).toISOString(), intervalSeconds: 5 } }); return; }
+    if (path === '/api/v1/auth/github/device/poll') { control.who = control.signingInAs; await route.fulfill({ json: { status: 'authorized', session: sessionFor(control.who) } }); return; }
+    const workspace = /^\/api\/v1\/workspaces\/ws-([ab])\/(.+)$/.exec(path);
+    if (!workspace) { await route.continue(); return; }
+    const owner = actors[workspace[1] as 'a' | 'b'], rest = workspace[2]!;
+    if (rest === 'snapshot') {
+      if (control.expired) { await route.fulfill({ status: 401, json: { code: 'SESSION_REQUIRED', message: 'Reconnect to Agent Town and sign in again if needed.' } }); return; }
+      await route.fulfill({ json: owner.snapshot }); return;
+    }
+    if (rest === 'coordination') { await route.fulfill({ json: emptyCoordination(owner.snapshot) }); return; }
+    if (/^agents\/[^/]+\/reports$/.test(rest) && method === 'GET') { await route.fulfill({ json: { reports: [], reportCount: 0, reportsNextOffset: null } }); return; }
+    if (method !== 'GET') control.writes.push(`${method} ${path}`);
+    await route.fulfill({ status: 404, json: { message: 'Unsupported fixture request.' } });
+  });
+}
+
+const isWide = (page: Page) => (page.viewportSize()?.width ?? 0) >= 900;
+const changeIdentity = (page: Page) => page.evaluate(() => window.dispatchEvent(new Event('online'))); // the app re-reads its session and workspace, as it does when the connection returns
+
+/** A leaves private work on screen: a manager proposal turned into a Tasks draft and edited, an agent search, and (with room for two drawers) a selected, followed agent. */
+async function leavePrivateWork(page: Page, from: 'proposal' | 'blank') {
+  const objective = page.getByRole('textbox', { name: 'Task objective', exact: true });
+  if (from === 'proposal') {
+    await page.getByRole('button', { name: 'Open manager', exact: true }).click();
+    await page.getByRole('button', { name: 'Create task draft', exact: true }).click();
+    await expect(objective).toHaveValue('A-PRIVATE rotate the Acme production credentials');
+  } else {
+    await openTasks(page);
+    await page.getByText('Prepare a new task', { exact: true }).click();
+  }
+  await objective.fill('A-PRIVATE rotate the Acme production credentials, then revoke the old ones');
+  await page.getByRole('textbox', { name: 'Acceptance criteria (one per line)', exact: true }).fill('A-PRIVATE criterion one\nA-PRIVATE criterion two');
+  await page.getByRole('button', { name: 'Agents', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Find an agent', exact: true }).fill('A worker');
+  await expect(page.locator('.agent-row')).toHaveCount(1);
+  if (isWide(page)) { // a narrow screen shows one drawer at a time, so a selection cannot stay open beside the sign-out control
+    await page.locator('.agent-row').first().click();
+    const follow = page.getByRole('button', { name: 'Follow this agent', exact: true });
+    if (await follow.isEnabled()) { // following needs the 3D world; without WebGL the List view has no camera to follow with
+      await follow.click();
+      await expect(page.getByRole('button', { name: /Following agent/ })).toBeVisible();
+    }
+  }
+}
+
+async function openTab(page: Page, label: 'Agents' | 'Tasks') {
+  if (await page.getByTestId('left-drawer').count()) await page.getByRole('button', { name: label, exact: true }).click();
+  else await openSectionFromDock(page, label);
+}
+const openSectionFromDock = (page: Page, label: 'Agents' | 'Tasks') => page.getByRole('button', { name: `Open ${label.toLowerCase()}`, exact: true }).click();
+
+/** No selection, no follow mode and no search left on screen. (Follow mode is per account: the same agent, opened again, is not being followed.) */
+async function expectNoLeftoverSelection(page: Page) {
+  await expect(page.getByTestId('right-drawer')).toHaveCount(0);
+  await openTab(page, 'Agents');
+  await expect(page.getByRole('textbox', { name: 'Find an agent', exact: true })).toHaveValue('');
+  if (isWide(page)) {
+    await page.locator('.agent-row').first().click();
+    await expect(page.getByRole('button', { name: 'Follow this agent', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Close details', exact: true }).click();
+    await expect(page.getByTestId('right-drawer')).toHaveCount(0);
+  }
+}
+
+/** Nothing the last person left on screen is there: no selection, no follow mode, no search, no proposal, no unsent Tasks text. */
+async function expectNoPrivateLeftovers(page: Page, ownProject: 'a-repo' | 'b-repo') {
+  await expectNoLeftoverSelection(page);
+  await openTab(page, 'Tasks');
+  await page.getByText('Prepare a new task', { exact: true }).click(); // a form with kept text would already be open, and this would close it
+  await expect(page.getByRole('textbox', { name: 'Task objective', exact: true })).toHaveValue('');
+  await expect(page.getByRole('textbox', { name: 'Acceptance criteria (one per line)', exact: true })).toHaveValue('');
+  await expect(page.getByRole('combobox', { name: 'Task repository', exact: true })).toHaveValue(ownProject); // the signed-in account's one project, never the last person's
+  await expect(page.locator('body')).not.toContainText('A-PRIVATE');
+}
+
+for (const next of ['b', 'a'] as const) {
+  test(`signing out clears the proposal, search, selection, follow mode and unsent Tasks text before ${next === 'b' ? 'the next account' : 'the same account'} signs in`, async ({ page }, testInfo) => {
+    test.setTimeout(60000);
+    const actors = { a: accountActor('a'), b: accountActor('b') };
+    const control = { who: 'a' as Who, expired: false, signingInAs: next as Who, writes: [] as string[] };
+    const errors: string[] = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await installEventFixture(page);
+    await routeAccounts(page, actors, control);
+    await page.goto('/');
+    await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
+    await leavePrivateWork(page, 'proposal');
+
+    await page.getByRole('button', { name: 'Connections', exact: true }).click();
+    await page.getByRole('button', { name: 'Sign out of GitHub', exact: true }).click();
+    // The Connections drawer is the sign-in surface: it stays open (WS1-02), and nothing of A's is on the page while nobody is signed in.
+    await expect(page.getByRole('button', { name: 'Sign in with GitHub', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Connections', level: 2 })).toBeVisible();
+    await expect(page.getByTestId('right-drawer')).toHaveCount(0);
+    await expect(page.locator('body')).not.toContainText('A-PRIVATE');
+    await page.getByRole('button', { name: 'Sign in with GitHub', exact: true }).click();
+    await expect(page.getByText('ABCD-EFGH', { exact: true })).toBeVisible();
+    await expect(page.getByText(`Signed in as ${next.toUpperCase()} owner.`, { exact: true })).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('.workspace-pill')).toContainText(`${next.toUpperCase()} workspace`);
+    // Signing back in as the same person does not bring an explicit sign-out's drafts back either.
+    await expect(page.getByRole('heading', { name: 'Connections', level: 2 })).toBeVisible();
+
+    await expectNoPrivateLeftovers(page, next === 'a' ? 'a-repo' : 'b-repo');
+    await page.screenshot({ path: testInfo.outputPath(`signed-out-then-${next}.png`) });
+    expect(control.writes).toEqual([]);
+    expect(errors).toEqual([]);
+  });
+}
+
+test('switching straight from account A to account B, with no sign-out, clears the same private state', async ({ page }) => {
+  const actors = { a: accountActor('a'), b: accountActor('b') };
+  const control = { who: 'a' as Who, expired: false, signingInAs: 'b' as Who, writes: [] as string[] };
+  await installEventFixture(page);
+  await routeAccounts(page, actors, control);
+  await page.goto('/');
+  await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
+  await leavePrivateWork(page, 'proposal');
+  control.who = 'b';
+  await changeIdentity(page);
+  await expect(page.locator('.workspace-pill')).toContainText('B workspace');
+  await expect(page.getByTestId('left-drawer')).toHaveCount(0); // a private drawer never reopens on B's data
+  await expectNoPrivateLeftovers(page, 'b-repo');
+  expect(control.writes).toEqual([]);
+});
+
+for (const next of ['a', 'b'] as const) {
+  test(`an expired session closes private drawers and clears what was on screen, keeps unsent Tasks text hidden, and ${next === 'a' ? 'returns it to the same person' : 'never shows it to another account'} (D72)`, async ({ page }, testInfo) => {
+    test.setTimeout(60000);
+    const actors = { a: accountActor('a'), b: accountActor('b') };
+    const control = { who: 'a' as Who, expired: false, signingInAs: next as Who, writes: [] as string[] };
+    const errors: string[] = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await installEventFixture(page);
+    await routeAccounts(page, actors, control);
+    await page.goto('/');
+    await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
+    await leavePrivateWork(page, 'blank');
+
+    // The session ends by itself (8-hour expiry, a restart): the workspace snapshot is refused and the session is anonymous again.
+    control.expired = true; control.who = 'nobody';
+    await changeIdentity(page);
+    await expect(page.getByRole('region', { name: 'Welcome to Agent Town', exact: true })).toBeVisible();
+    await expect(page.getByTestId('left-drawer')).toHaveCount(0);
+    await expect(page.getByTestId('right-drawer')).toHaveCount(0);
+    await expect(page.locator('body')).not.toContainText('A-PRIVATE');
+
+    control.expired = false;
+    await page.getByRole('button', { name: 'Set up your workspace', exact: true }).click();
+    await page.getByRole('button', { name: 'Sign in with GitHub', exact: true }).click();
+    await expect(page.getByText('ABCD-EFGH', { exact: true })).toBeVisible();
+    await expect(page.getByText(`Signed in as ${next.toUpperCase()} owner.`, { exact: true })).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('.workspace-pill')).toContainText(`${next.toUpperCase()} workspace`);
+    await page.screenshot({ path: testInfo.outputPath(`expired-then-${next}.png`) });
+
+    if (next === 'a') {
+      // The same owner in the same workspace: the unsent text is back, and the search, selection and follow mode are not.
+      await expectNoLeftoverSelection(page);
+      await openTab(page, 'Tasks');
+      await expect(page.getByRole('textbox', { name: 'Task objective', exact: true })).toHaveValue('A-PRIVATE rotate the Acme production credentials, then revoke the old ones');
+      await expect(page.getByRole('textbox', { name: 'Acceptance criteria (one per line)', exact: true })).toHaveValue('A-PRIVATE criterion one\nA-PRIVATE criterion two');
+    } else {
+      await expectNoPrivateLeftovers(page, 'b-repo');
+    }
+    expect(control.writes).toEqual([]);
+    expect(errors).toEqual([]);
+  });
+}

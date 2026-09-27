@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
-import type { Agent, ArchivedAgent, NativeSession, NativeSessionPage, NativeSource, ObservationConnection, ObservationEvent, TownState } from '@agent-town/contracts';
+import type { Agent, ArchivedAgent, NativeHideAllCounts, NativeSession, NativeSessionPage, NativeSource, ObservationConnection, ObservationEvent, TownState } from '@agent-town/contracts';
 import { allocateAgentHome, nativeSessionTitleSchema, RETAINED_AGENT_LIMIT } from '@agent-town/contracts';
 import { IdentityError } from '../identity/types.js';
 import { applyObservation, observationProviders } from './reducer.js';
@@ -242,14 +242,19 @@ export class NativeInventory {
       if (item.parentNativeSessionId) this.saveAlias(childAlias(source.id, item.parentNativeSessionId, item.nativeSessionId), id);
     }
   }
-  page(state: TownState, options: { repoId?: string; sourceId?: string; cursor?: string; includeOlder?: boolean } = {}): NativeSessionPage {
+  page(state: TownState, options: { repoId?: string; sourceId?: string; cursor?: string; includeOlder?: boolean; visibility?: 'hidden' } = {}): NativeSessionPage {
     const offset = options.cursor === undefined ? 0 : Number(options.cursor);
     if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100_000) throw new IdentityError('INVALID_CURSOR', 'Refresh the session list and try again.');
     const rows = this.db.prepare('SELECT data FROM native_sessions WHERE (? IS NULL OR repo_id=?) AND (? IS NULL OR source_id=?) ORDER BY id').all(options.repoId ?? null, options.repoId ?? null, options.sourceId ?? null, options.sourceId ?? null) as { data: string }[];
+    const all = rows.map(row => JSON.parse(row.data) as NativeSession);
+    // H0-15: hiddenTotal is scoped the same way as the query above (repoId/sourceId) but, unlike `items`
+    // below, is never windowed by the 30-day cutoff — a session hidden 6 months ago is still hidden today,
+    // even on a page that would not otherwise list it without includeOlder.
+    const hiddenTotal = all.filter(item => item.visibility === 'hidden').length;
     const cutoff = Date.now() - 30 * 86400000;
-    const items = rows.map(row => JSON.parse(row.data) as NativeSession).filter(item => options.includeOlder || Date.parse(item.observedAt ?? item.nativeUpdatedAt ?? item.discoveredAt) >= cutoff)
+    const items = all.filter(item => (options.includeOlder || Date.parse(item.observedAt ?? item.nativeUpdatedAt ?? item.discoveredAt) >= cutoff) && (!options.visibility || item.visibility === options.visibility))
       .sort((a, b) => (b.observedAt ?? b.nativeUpdatedAt ?? b.discoveredAt).localeCompare(a.observedAt ?? a.nativeUpdatedAt ?? a.discoveredAt) || a.id.localeCompare(b.id));
-    return { items: items.slice(offset, offset + 25).map(item => { const live = state.agents.find(agent => agent.id === item.agentId); return { ...item, sceneVisible: !!live, activity: live?.activity ?? item.activity }; }), total: items.length, nextCursor: offset + 25 < items.length ? String(offset + 25) : null };
+    return { items: items.slice(offset, offset + 25).map(item => { const live = state.agents.find(agent => agent.id === item.agentId); return { ...item, sceneVisible: !!live, activity: live?.activity ?? item.activity }; }), total: items.length, nextCursor: offset + 25 < items.length ? String(offset + 25) : null, hiddenTotal };
   }
   detail(id: string, state: TownState): Agent {
     id = this.alias(actorAlias(id)) ?? id;
@@ -258,13 +263,19 @@ export class NativeInventory {
     if (!agent) throw new IdentityError('NATIVE_SESSION_NOT_FOUND', 'This native session is unavailable.', 404);
     return agent;
   }
-  visibility(id: string, visible: boolean, state: TownState): void {
+  /** `onLimit: 'refuse'` (H0-15) is opt-in so every existing caller that omits it — including test fixtures
+   * that show many sessions in a loop to seed overflow state past RETAINED_AGENT_LIMIT — keeps today's exact
+   * behaviour: it marks the session shown without ever placing it in town if the town is already full.
+   * The real "Show in town" HTTP route passes 'refuse' instead, so a session actually stays 'hidden' (findable
+   * and reversible) rather than silently losing both its town slot and its place on the hidden list. */
+  visibility(id: string, visible: boolean, state: TownState, options: { onLimit?: 'silent' | 'refuse' } = {}): void {
     this.writing();
     id = this.alias(actorAlias(id)) ?? id;
     const row = this.row(id);
     if (!row) throw new IdentityError('NATIVE_SESSION_NOT_FOUND', 'This native session is unavailable.', 404);
     const session = JSON.parse(row.data) as NativeSession, agent = this.actor(id, state) ?? this.makeAgent(session, state);
     if (visible && !state.repositories.some(repo => repo.id === session.repoId)) throw new IdentityError('LOCAL_REPOSITORY_REQUIRED', 'Reconnect this project before showing its session in town.', 409);
+    if (visible && options.onLimit === 'refuse' && !state.agents.some(actor => actor.id === id) && state.agents.length >= RETAINED_AGENT_LIMIT) throw new IdentityError('NATIVE_RESIDENT_LIMIT', 'Town is full at 200 residents. Hide one to show this.', 429);
     session.visible = visible; session.visibility = visible ? 'shown' : 'hidden';
     if (!visible) state.agents = state.agents.filter(actor => actor.id !== id);
     else if (!state.agents.some(actor => actor.id === id) && state.agents.length < RETAINED_AGENT_LIMIT) {
@@ -273,6 +284,62 @@ export class NativeInventory {
     }
     session.sceneVisible = state.agents.some(actor => actor.id === id); this.save(session, agent);
     state.history = { archivedAgents: (this.db.prepare('SELECT count(*) AS count FROM agent_archive').get() as { count: number }).count, updatedAt: new Date().toISOString() };
+  }
+  /** H0-12. Read-only decision of what "hide every watched session of this project" does right now; previewHideProject and
+   * hideProject both read it, so the count the owner is told is the count that is applied.
+   *  - hide: native-backed external residents of the house (an actor with a saved native session row AND a native identity,
+   *    observation.nativeSourceId or discovery.sourceId), plus shown sessions still waiting for a free slot, which would
+   *    otherwise pop into the town the moment hiding freed one;
+   *  - skippedLegacy: external residents without a native identity (every Cursor hook session). A later hook event without
+   *    nativeSourceId would create the character again, so they are counted and left in town, to be archived from History after
+   *    their connection is revoked;
+   *  - managed runs are never touched: the runner owns those characters;
+   *  - archived sessions are History, not town: they are neither hidden nor counted (hide is not archive). */
+  private hidePlan(repoId: string, state: TownState): { rows: SessionRow[]; counts: NativeHideAllCounts } {
+    if (state.workspace.id !== this.workspaceId || !state.repositories.some(repo => repo.id === repoId)) throw new IdentityError('NATIVE_PROJECT_NOT_FOUND', 'Select a connected project.', 404);
+    const managed = new Set((state.runner?.runs ?? []).map(run => run.id));
+    const rows = new Map((this.db.prepare('SELECT *,rowid AS ordinal FROM native_sessions WHERE repo_id=? ORDER BY rowid').all(repoId) as SessionRow[])
+      .filter(row => !managed.has(row.id) && !managed.has(row.agent_id)).map(row => [row.id, row] as const));
+    const live = new Set(state.agents.map(agent => agent.id));
+    const archived = new Set((this.db.prepare('SELECT id FROM agent_archive WHERE repo_id=?').all(repoId) as { id: string }[]).map(row => row.id));
+    const hide = new Map<string, SessionRow>();
+    let skippedLegacy = 0, alreadyHidden = 0;
+    for (const agent of state.agents) {
+      if (agent.repoId !== repoId || managed.has(agent.id)) continue;
+      const row = rows.get(agent.id);
+      if (row && (agent.observation?.nativeSourceId || agent.discovery?.sourceId)) hide.set(row.id, row);
+      else if (agent.observation || agent.discovery) skippedLegacy++;
+    }
+    for (const row of rows.values()) {
+      if (live.has(row.id) || archived.has(row.id)) continue;
+      const session = sessionData(row);
+      if (session.visibility === 'hidden') alreadyHidden++;
+      else if (session.visible) hide.set(row.id, row);
+    }
+    return { rows: [...hide.values()], counts: { hidden: hide.size, alreadyHidden, skippedLegacy } };
+  }
+  /** What hideProject would do now, without writing. A caller uses it to skip its commit when nothing would change. */
+  previewHideProject(repoId: string, state: TownState): NativeHideAllCounts { return this.hidePlan(repoId, state).counts; }
+  /** H0-12: hides every native-backed external resident of one project inside the caller's ONE state transaction, so a failure
+   * on any row leaves state, inventory and archive as they were. Each session ends exactly as visibility(id, false) leaves it:
+   * its actor and reports stay inspectable, nothing is archived or deleted. Hide is a snapshot: a session this inventory has not
+   * seen still appears when its tool reports. There is deliberately no bulk "show all"; undo is per session. Writes one audit
+   * note of counts only (no session name, id or path). */
+  hideProject(repoId: string, state: TownState, now: string): NativeHideAllCounts {
+    this.writing();
+    const { rows, counts } = this.hidePlan(repoId, state);
+    if (!rows.length) return counts;
+    for (const row of rows) {
+      const session = sessionData(row), agent = this.actor(row.id, state) ?? this.makeAgent(session, state);
+      session.visible = false; session.visibility = 'hidden'; session.sceneVisible = false;
+      this.save(session, agent);
+    }
+    const hidden = new Set(rows.map(row => row.id));
+    state.agents = state.agents.filter(agent => !hidden.has(agent.id));
+    const sessions = (count: number) => `${count} session${count === 1 ? '' : 's'}`;
+    state.activity.unshift({ id: randomUUID(), kind: 'system', createdAt: now, message: `Hid ${sessions(counts.hidden)} from town; saved reports are kept and nothing was deleted. New sessions from a tool that is still connected can still appear.${counts.skippedLegacy ? ` ${sessions(counts.skippedLegacy)} without a native identity stayed in town.` : ''}` });
+    state.activity = state.activity.slice(0, 500);
+    return counts;
   }
   /** Returns null for legacy receipts whose native profile is not established. */
   receive(state: TownState, connection: ObservationConnection, event: ObservationEvent, now: string): string | null {

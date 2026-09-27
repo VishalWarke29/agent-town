@@ -1,6 +1,6 @@
 import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Page } from '@playwright/test';
-import type { Agent, AgentHistoryDetail, BrowserSession, GitHubListingStatus, Handoff, Repository, Snapshot } from '@agent-town/contracts';
+import type { Agent, AgentHistoryDetail, BrowserSession, GitHubListingStatus, Handoff, InstructionFile, Repository, Snapshot } from '@agent-town/contracts';
 
 const workspaceId = 'fixture-repository-journey';
 const checkedAt = '2026-09-14T12:00:00Z';
@@ -32,7 +32,7 @@ async function fixture(page: Page, mutate: (path: string, body: unknown, state: 
     return reply({ error: { code: 'UNEXPECTED_FIXTURE_REQUEST', message: 'No real requests in repository fixtures.' } }, 400);
   });
   await page.goto('/');
-  await page.getByRole('button', { name: 'Connect repositories', exact: true }).click();
+  await page.getByRole('button', { name: 'Connect a project', exact: true }).click();
   return { snapshot, publish };
 }
 
@@ -59,18 +59,18 @@ test('folder setup explains disabled actions and preserves stale evidence throug
     return { ok: true };
   });
   const local = page.getByRole('region', { name: 'Local folders', exact: true });
-  await expect(local.getByLabel('Selected parent folder', { exact: true })).toBeEmpty();
-  await expect(local.getByLabel('Selected parent folder', { exact: true })).not.toHaveAttribute('placeholder');
+  await expect(local.getByLabel('Project folder', { exact: true })).toBeEmpty();
+  await expect(local.getByLabel('Project folder', { exact: true })).not.toHaveAttribute('placeholder');
   await expect(local.getByText('No folders are allowed yet.', { exact: true })).toBeVisible();
-  await expect(local.getByRole('button', { name: 'Add selected folder', exact: true })).toBeDisabled();
+  await expect(local.getByRole('button', { name: 'Add this project', exact: true })).toBeDisabled();
   await expect(local.getByRole('button', { name: 'Scan selected folders', exact: true })).toBeDisabled();
-  await expect(local.getByText('Add a parent folder above before scanning.', { exact: true })).toBeVisible();
-  await page.getByLabel('Selected parent folder', { exact: true }).fill(String.raw`C:\fixture-projects\missing`);
-  await local.getByRole('button', { name: 'Add selected folder', exact: true }).click();
+  await expect(local.getByText('Add a project folder above before scanning.', { exact: true })).toBeVisible();
+  await page.getByLabel('Project folder', { exact: true }).fill(String.raw`C:\fixture-projects\missing`);
+  await local.getByRole('button', { name: 'Add this project', exact: true }).click();
   await expect(local.getByRole('alert')).toContainText('unavailable or is not a directory');
-  await page.getByLabel('Selected parent folder', { exact: true }).fill(String.raw`C:\fixture-projects`);
-  await local.getByRole('button', { name: 'Add selected folder', exact: true }).click();
-  await expect(local.getByRole('heading', { name: 'Folders allowed for discovery · 1/8' })).toBeVisible();
+  await page.getByLabel('Project folder', { exact: true }).fill(String.raw`C:\fixture-projects`);
+  await local.getByRole('button', { name: 'Add this project', exact: true }).click();
+  await expect(local.getByRole('heading', { name: 'Folders Agent Town may look in · 1/8' })).toBeVisible();
   snapshot.state.repositories = [structuredClone(repo)]; snapshot.state.discovery!.candidates = [];
   await publish();
   await local.getByRole('button', { name: 'Scan selected folders', exact: true }).click();
@@ -148,4 +148,43 @@ test('GitHub access diagnostics remain separate from local scope and explain emp
   expect((await new AxeBuilder({ page }).include('.repository-setup').analyze()).violations).toEqual([]);
   await github.getByText(/2 received · 2 retained from this check · 2 currently available/).scrollIntoViewIfNeeded();
   await page.screenshot({ path: `docs/assets/previews/repository-github-${testInfo.project.name}.png` });
+});
+
+// SK-01: the instruction-files screen used to say a skill row was "managed in Skills section" —
+// no such section exists. It now lists skill files by path, size and date only and says a Skills
+// section is planned, from apps/web/src/skillsCopy.ts (shared verbatim by the 3D drawer and the List
+// view, since InstructionFiles.tsx is the one component both render).
+test('a skill file is listed by path, size and date only, with no "managed in Skills section" claim', async ({ page }, testInfo) => {
+  const skillWorkspaceId = 'fixture-skill-files';
+  const skillFile: InstructionFile = { path: '.claude/skills/deploy/SKILL.md', tool: 'claude', scope: 'repo', size: 512, modifiedAt: checkedAt, hash: null, appliedToRun: false, kind: 'skill' };
+  const skillRepo: Repository = { ...repo, id: 'skill-fixture', name: 'Skill fixture', instructions: [skillFile] };
+  const snapshot: Snapshot = { cursor: 1, state: { schemaVersion: 1, workspace: { id: skillWorkspaceId, name: 'Skill fixture workspace', mode: 'private' }, simulation: { running: false, step: 0 }, repositories: [skillRepo], agents: [], handoffs: [], activity: [], manager: { version: 0, brief: 'No reports received.', updatedAt: null }, discovery: { roots: [], candidates: [], operation: null } } };
+  const session: BrowserSession = { csrf: 'skill-fixture-csrf', mode: 'private', applicationMode: 'development', user: { id: 'skill-owner', login: 'skill-owner', displayName: 'Skill Owner', avatarUrl: null }, workspaces: [{ id: skillWorkspaceId, name: 'Skill fixture workspace', kind: 'personal' }], identity: { configured: true } };
+  await page.addInitScript(() => {
+    class FixtureEvents extends EventTarget {
+      onopen: (() => void) | null = null;
+      closed = false;
+      constructor() { super(); setTimeout(() => { if (!this.closed) this.onopen?.(); }, 0); }
+      close() { this.closed = true; }
+    }
+    window.EventSource = FixtureEvents as unknown as typeof EventSource;
+  });
+  await page.route('**/api/v1/**', async route => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/api/v1/session') return route.fulfill({ json: session });
+    if (path.endsWith('/snapshot')) return route.fulfill({ json: snapshot });
+    return route.fulfill({ status: 404, json: { message: 'Unsupported fixture request' } });
+  });
+  await page.goto('/');
+  await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Skill fixture', exact: true }).click();
+  await page.getByRole('button', { name: 'Repository details', exact: true }).click();
+  const drawer = page.getByTestId('right-drawer');
+  await expect(drawer.getByRole('heading', { name: 'Skill files', level: 4 })).toBeVisible();
+  await expect(drawer.getByText('Skill files found in this folder. Listed by path, size and date only; Agent Town does not read, run or manage them. A Skills section is planned.', { exact: true })).toBeVisible();
+  await expect(drawer.getByText(skillFile.path, { exact: true })).toBeVisible();
+  await expect(drawer.getByText(/managed in/i)).toHaveCount(0);
+  expect((await new AxeBuilder({ page }).include('[data-testid="right-drawer"]').analyze()).violations).toEqual([]);
+  await drawer.getByText(skillFile.path, { exact: true }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: `docs/assets/previews/skill-files-wording-${testInfo.project.name}.png` });
 });

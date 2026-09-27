@@ -2,15 +2,16 @@ import { randomUUID } from 'node:crypto';
 import { watch, type FSWatcher } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
-import { addRootSchema, connectLocalProjectSchema, removeRootSchema, selectRepositoriesSchema, reconcileAgentHomes, type Repository, type ConnectLocalProjectResult } from '@agent-town/contracts';
+import { addRootSchema, connectLocalProjectSchema, folderPickIdSchema, removeRootSchema, selectRepositoriesSchema, reconcileAgentHomes, type Repository, type ConnectLocalProjectResult } from '@agent-town/contracts';
 import { canonicalizeRoot, discoverRepositories, inspectLocalProject, isWithin, DiscoveryError, type DiscoveredRepository, type DiscoveryResult, type LocalProjectDirectory } from './discovery/index.js';
 import { IdentityError, type GitHubRepositoryListing } from './identity/index.js';
 import type { Store } from './store.js';
 import { checkedPath } from './discovery/paths.js';
 import { markLocalAttemptIncomplete, reconcileGitHubDiscovery, reconcileLocalDiscovery } from './repository-state.js';
 import { requireRepositoryRemovable, rootRemovalReview } from './history-state.js';
+import { folderPickNotFound, type FolderPicker } from './folder-picker.js';
 
-interface Dependencies { store(request: FastifyRequest): Store; stores?(): Store[]; listGitHub(request: FastifyRequest): Promise<GitHubRepositoryListing>; listGitHubBackground?(store: Store): Promise<GitHubRepositoryListing>; refreshIntervalMs?: number; githubRefreshIntervalMs?: number; discover?: typeof discoverRepositories }
+interface Dependencies { store(request: FastifyRequest): Store; stores?(): Store[]; listGitHub(request: FastifyRequest): Promise<GitHubRepositoryListing>; listGitHubBackground?(store: Store): Promise<GitHubRepositoryListing>; refreshIntervalMs?: number; githubRefreshIntervalMs?: number; discover?: typeof discoverRepositories; folderPicker?: FolderPicker }
 const githubSafeCodes = ['github_unauthorized', 'github_access_limited', 'github_permissions_too_broad', 'github_listing_cancelled', 'github_listing_timeout', 'github_unavailable', 'github_response_invalid', 'github_not_connected'];
 const colors = ['#859b87', '#bc9782', '#c6ad71', '#829ca3', '#a78caa'];
 const position = (index: number): [number, number] => index < 3 ? [[-6, -3.3], [5.7, -3.8], [-5, 5.5]][index] as [number, number] : [18 + ((index - 3) % 5) * 8, -4 + Math.floor((index - 3) / 5) * 8];
@@ -22,7 +23,7 @@ function fromLocal(repo: DiscoveredRepository, result: DiscoveryResult, index: n
     source: 'local', projectKind: 'git', localPath: repo.canonicalPath, selectedRoot: repo.rootPath,
     scan: { at: repo.scannedAt, coverage: result.coverage.status, reasons: result.coverage.issues },
     git: { availability: repo.git.availability, head: repo.git.head, changedFiles: repo.git.changedFiles, untrackedFiles: null, ...(repo.git.reason ? { reason: repo.git.reason } : {}) },
-    instructions: repo.instructions.map(file => ({ path: file.path, scope: file.scope, tool: file.tool, size: file.bytes, modifiedAt: file.modifiedAt, hash: null, appliedToRun: false })),
+    instructions: repo.instructions.map(file => ({ path: file.path, scope: file.scope, tool: file.tool, size: file.bytes, modifiedAt: file.modifiedAt, hash: null, appliedToRun: false, kind: file.kind })),
   };
 }
 
@@ -157,6 +158,38 @@ export function registerRepositoryApi(app: FastifyInstance, dependencies: Depend
     const snapshot = result.snapshot;
     return { repository: snapshot.state.repositories.find(repo => repo.id === project.id)!, snapshot, duplicate } satisfies ConnectLocalProjectResult;
   });
+
+  // "Browse..." folder window. The service opens it on the owner's desktop and hands back only the chosen path as text;
+  // adding that folder still goes through the routes above, which validate it again. A running scan is irrelevant here.
+  const folderPicker = dependencies.folderPicker;
+  if (folderPicker) {
+    const pickId = (request: FastifyRequest) => {
+      const parsed = folderPickIdSchema.safeParse((request.params as { pickId?: unknown }).pickId);
+      if (!parsed.success) throw folderPickNotFound();
+      return parsed.data;
+    };
+    app.post(`${prefix}/folders/pick`, async request => {
+      const store = dependencies.store(request);
+      const body = request.body;
+      if (body !== undefined && body !== null && !(typeof body === 'object' && !Array.isArray(body) && Object.keys(body).length === 0)) throw new IdentityError('INVALID_REQUEST', 'This action takes no input.');
+      const workspaceId = store.snapshot().state.workspace.id;
+      const pick = folderPicker.start(workspaceId);
+      // Answer only once the window is really up (or it failed to appear within the handshake), so a `waiting`
+      // response always means a window is open on the desktop. A repeat click for a window that is already up gets
+      // the live pick straight back, still marked `alreadyOpen`.
+      if (pick.state !== 'waiting') return pick;
+      const settled = await folderPicker.whenOpened(workspaceId, pick.id);
+      return pick.alreadyOpen ? { ...settled, alreadyOpen: true } : settled;
+    });
+    app.get(`${prefix}/folders/pick/:pickId`, async request => {
+      const store = dependencies.store(request);
+      return folderPicker.status(store.snapshot().state.workspace.id, pickId(request));
+    });
+    app.post(`${prefix}/folders/pick/:pickId/cancel`, async request => {
+      const store = dependencies.store(request);
+      return folderPicker.cancel(store.snapshot().state.workspace.id, pickId(request));
+    });
+  }
 
   app.post(`${prefix}/roots/remove/preview`, request => {
     const store = dependencies.store(request); assertIdle(store);
@@ -335,5 +368,5 @@ export function registerRepositoryApi(app: FastifyInstance, dependencies: Depend
       if (state.discovery?.roots.length && !jobs.has(state.workspace.id)) { try { startScan(store, true); } catch { /* Retry on the next bounded reconciliation. */ } }
     } } catch { app.log.error('Repository reconciliation could not read the local registry.'); }
   }, dependencies.refreshIntervalMs ?? 60000); timer.unref();
-  return async () => { closing = true; clearInterval(timer); clearInterval(githubTimer); for (const id of watchers.keys()) clearWatchers(id); for (const job of jobs.values()) job.abort.abort(); await Promise.allSettled([...jobs.values()].map(job => job.promise).concat([...listings.values()].map(promise => promise.then(() => undefined)))); };
+  return async () => { closing = true; const pickerClosed = folderPicker?.close(); clearInterval(timer); clearInterval(githubTimer); for (const id of watchers.keys()) clearWatchers(id); for (const job of jobs.values()) job.abort.abort(); await Promise.allSettled([...jobs.values()].map(job => job.promise).concat([...listings.values()].map(promise => promise.then(() => undefined)), pickerClosed ?? [])); };
 }

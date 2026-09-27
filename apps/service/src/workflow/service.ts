@@ -12,6 +12,24 @@ import { managerQueueStatus, queueBasis } from './queue.js';
 type Commit = ReturnType<Store['commit']>;
 export interface WorkflowOptions { store: Store; vault: CredentialVault; provider?: WorkflowProvider; now?: () => number }
 const fingerprint = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+
+// One shared list of automatic-processing wait codes, read by both the guard that skips a
+// repeat attempt and the catch that records why one was skipped, so they can never disagree
+// (previously the guard only knew 3 of these 10 codes, so 7 kept re-counting/re-reading the
+// vault every 30 seconds even though they could not succeed until something changed).
+// STICKY codes only retry after queueBasis changes (a new report, config, connection, budget,
+// billing day, or price-record change). TRANSIENT codes retry on a simple in-memory backoff
+// (1, 2, 4, 8 minutes, capped at 30) because the same basis may succeed again on its own.
+export const MANAGER_STICKY_WAIT_CODES = ['manager_input_large', 'credential_unavailable', 'model_capability_unverified', 'provider_rejected', 'run_budget_reached', 'daily_budget_reached', 'manager_budget_reached', 'manager_dispatch_failed'] as const;
+export const MANAGER_TRANSIENT_WAIT_CODES = ['provider_unavailable', 'token_count_unavailable'] as const;
+const MANAGER_WAIT_CODES: readonly string[] = [...MANAGER_STICKY_WAIT_CODES, ...MANAGER_TRANSIENT_WAIT_CODES];
+const MANAGER_TRANSIENT_BACKOFF_START_MS = 60_000, MANAGER_TRANSIENT_BACKOFF_MAX_MS = 30 * 60_000;
+export function isManagerWaitCode(code: string): boolean { return MANAGER_WAIT_CODES.includes(code); }
+/** A provider rejection from an HTTP 429 response is a rate limit: worth a timed retry, unlike other rejections which wait for a real change. */
+export function isTransientManagerWaitCode(code: string, providerStatus?: number): boolean {
+  if (code === 'provider_rejected') return providerStatus === 429;
+  return (MANAGER_TRANSIENT_WAIT_CODES as readonly string[]).includes(code);
+}
 export const providerCredentialReference = (workspaceId: string, connectionId: string): string => {
   if (!/^[A-Za-z0-9_-]{1,80}$/.test(workspaceId) || !/^[A-Za-z0-9_-]{1,60}$/.test(connectionId)) throw new WorkflowError('credential_scope_invalid', 'Invalid workspace or connection scope.', 400);
   return `provider-${workspaceId}-${connectionId}`;
@@ -25,6 +43,10 @@ export class WorkflowService {
   private readonly abort = new AbortController();
   private readonly connecting = new Set<string>();
   private processing = false;
+  // In-memory only (lost on restart, tracked in WS6-25): the current transient-wait episode,
+  // identified by its code and queueBasis, so a repeat guard-echo never doubles the backoff by
+  // itself. Only a genuine post-window retry that fails again escalates it.
+  private transientBackoff: { code: string; basisHash: string; retryAtMs: number; ms: number } | null = null;
   constructor(options: WorkflowOptions) { this.store = options.store; this.vault = options.vault; this.provider = options.provider ?? new OfficialWorkflowProvider(); this.now = options.now ?? Date.now; }
   private time(): string { return new Date(this.now()).toISOString(); }
   private checkOpen(): void { if (this.abort.signal.aborted) throw new WorkflowError('workflow_stopped', 'The workflow service is stopping.'); }
@@ -150,6 +172,10 @@ export class WorkflowService {
           amountMicroUsd: maximumRequestCost(input.model, input.maxInputTokens, input.maxOutputTokens), runBudgetMicroUsd: input.requestBudgetMicroUsd }, this.time());
       }
       workflow.manager.config = input;
+      // Set once, the first time the manager is ever enabled. Reports already saved at that
+      // moment are protected from a surprise automatic sweep; later re-saves of the config
+      // never move this baseline forward again.
+      if (input.enabled && !workflow.manager.baselineAt) workflow.manager.baselineAt = this.time();
       queueManagerReports(state);
       return 'manager.configured';
     }, fingerprint({ action: 'manager.config', input: parsed.data }));
@@ -202,9 +228,13 @@ export class WorkflowService {
       const existing = workflow.manager.jobs.find(value => value.id === id);
       if (existing) return { duplicate: true, snapshot: this.store.snapshot() };
       if (!config.enabled || !workflow.policy.paidEnabled || !config.connectionId || !config.model) throw new WorkflowError('manager_disabled', 'Enable the manager with its connection, model, and allowance first.');
+      // "Automatic" and "enabled" are separate switches: the 30-second timer needs both, the
+      // explicit Process action needs only enabled. This is a defensive second check; the
+      // timer itself (workflow-api.ts) already only calls here with automatic once both are true.
+      if (options.automatic && config.automatic !== true) throw new WorkflowError('manager_explicit_only', 'Automatic processing is off. Use the explicit paid action to process saved reports.');
       const waiting = workflow.manager.waitingStatus;
-      if (options.automatic && waiting?.basisHash && ['manager_input_large', 'credential_unavailable', 'model_capability_unverified'].includes(waiting.code)
-        && waiting.basisHash === queueBasis(initial, this.time())) throw new WorkflowError(waiting.code, waiting.message);
+      if (options.automatic && waiting?.basisHash && isManagerWaitCode(waiting.code) && waiting.basisHash === queueBasis(initial, this.time())
+        && (!waiting.retryAt || this.now() < Date.parse(waiting.retryAt))) throw new WorkflowError(waiting.code, waiting.message);
       if (workflow.manager.jobs.some(value => value.status === 'running' || value.status === 'uncertain')) throw new WorkflowError('manager_reconciliation_required', 'Wait for the active request or reconcile its uncertain outcome.');
       if (workflow.reservations.some(value => value.purpose === 'manager' && value.status !== 'settled')) throw new WorkflowError('manager_reconciliation_required', 'The previous manager request still holds a budget reservation. Reconcile its usage first.');
       if (workflow.manager.jobs.length >= 1000 || workflow.manager.versions.length >= 1000) throw new WorkflowError('manager_capacity', 'The local manager history is full. Apply a reviewed retention policy before more processing.');
@@ -217,6 +247,16 @@ export class WorkflowService {
       if (options.automatic && starts.length >= 6) throw new WorkflowError('manager_hourly_limit', 'Six automatic manager batches have run this hour. Reports remain saved.');
       const connection = workflow.connections.find(value => value.id === config.connectionId && value.status === 'verified');
       if (!connection) throw new WorkflowError('connection_unavailable', 'The selected manager connection is unavailable. No fallback is allowed.');
+      // A cheap local pre-check: even the floor cost (no additional input tokens, the full
+      // output cap) is checked against the remaining allowance before any vault read or
+      // provider count call. Other reservation problems (stale price, unattested quality,
+      // an unavailable model) still surface with full context inside the loop below.
+      try {
+        reserveOperation(structuredClone(initial), { id: 'manager-floor-check', runId: 'manager-floor-check', purpose: 'manager', connectionId: connection.id, model: config.model,
+          amountMicroUsd: Math.max(1, maximumRequestCost(config.model, 0, config.maxOutputTokens)), runBudgetMicroUsd: config.requestBudgetMicroUsd }, this.time());
+      } catch (error) {
+        if (error instanceof WorkflowError && ['run_budget_reached', 'daily_budget_reached', 'manager_budget_reached'].includes(error.code)) throw error;
+      }
       const key = await this.vault.get(providerCredentialReference(initial.workspace.id, connection.id));
       if (!key) throw new WorkflowError('credential_unavailable', 'Reconnect the selected provider before paid work.');
       this.checkOpen();
@@ -340,10 +380,26 @@ export class WorkflowService {
         if (pending.length) {
           const status = managerQueueStatus(state, this.time());
           const code = error instanceof WorkflowError ? error.code : 'manager_dispatch_failed';
-          const persistent = ['manager_input_large', 'credential_unavailable', 'model_capability_unverified', 'token_count_unavailable', 'provider_rejected', 'provider_unavailable', 'run_budget_reached', 'daily_budget_reached', 'manager_budget_reached', 'manager_dispatch_failed'].includes(code);
+          const providerStatus = error instanceof ProviderRequestError ? error.providerStatus : undefined;
+          const waitable = isManagerWaitCode(code);
+          const transient = waitable && isTransientManagerWaitCode(code, providerStatus);
+          const currentBasis = queueBasis(state, this.time());
+          let retryAt: string | null = null;
+          if (transient) {
+            const now = this.now();
+            const active = this.transientBackoff?.code === code && this.transientBackoff.basisHash === currentBasis;
+            if (active && now < this.transientBackoff!.retryAtMs) retryAt = new Date(this.transientBackoff!.retryAtMs).toISOString();
+            else {
+              const ms = active ? Math.min(this.transientBackoff!.ms * 2, MANAGER_TRANSIENT_BACKOFF_MAX_MS) : MANAGER_TRANSIENT_BACKOFF_START_MS;
+              const retryAtMs = now + ms;
+              this.transientBackoff = { code, basisHash: currentBasis, retryAtMs, ms };
+              retryAt = new Date(retryAtMs).toISOString();
+            }
+          } else if (waitable) this.transientBackoff = null;
           this.persistQueueStatus({ ...status, state: 'waiting', code,
             message: error instanceof WorkflowError ? error.message : 'The pre-dispatch check failed. No inference was started; review the connection before retrying.',
-            basisHash: persistent ? queueBasis(state, this.time()) : undefined,
+            basisHash: waitable ? currentBasis : undefined,
+            retryAt: waitable ? retryAt : status.retryAt,
           });
         }
       }

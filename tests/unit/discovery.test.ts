@@ -6,18 +6,32 @@ import { join, parse, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { canonicalizeRoot, discoverRepositories } from '../../apps/service/src/discovery';
+import { platformSuite } from '../helpers/real-tool-test';
+
+/** Temporarily overrides environment variables for one async block, restoring the previous values
+ * (or deleting them, if previously unset) afterward even if the block throws. */
+async function withEnv(overrides: Record<string, string>, fn: () => Promise<void>): Promise<void> {
+  const previous: Record<string, string | undefined> = {};
+  for (const key of Object.keys(overrides)) { previous[key] = process.env[key]; process.env[key] = overrides[key]; }
+  try { await fn(); }
+  finally { for (const key of Object.keys(overrides)) { if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key]; } }
+}
 
 const execute = promisify(execFile);
 let fixture: string;
 const nullFile = process.platform === 'win32' ? 'NUL' : '/dev/null';
 const gitEnv = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: nullFile, GIT_CONFIG_SYSTEM: nullFile };
-const git = (args: string[]) => execute('git', args, { env: gitEnv, windowsHide: true, timeout: 3000 });
+// The 30 s limit is only a safety net for fixture setup (it was 3 s): on a busy machine (other agents, other test runs) a single `git init`, `git commit` or `git worktree add`
+// took longer than 3 s, was killed half way, and the test failed with 'Command failed: git ...' and an EBUSY on the folder git had just been using (MG-40 follow-up, 2026-09-24).
+// A git that really hangs is still killed, after 30 s. No assertion depends on this number.
+const git = (args: string[]) => execute('git', args, { env: gitEnv, windowsHide: true, timeout: 30_000 });
 
 beforeEach(async () => { fixture = await mkdtemp(join(tmpdir(), 'agent-town-discovery-')); });
 afterEach(async () => {
   const resolved = resolve(fixture);
   if (!resolved.startsWith(`${resolve(tmpdir())}${process.platform === 'win32' ? '\\' : '/'}agent-town-discovery-`)) throw new Error('Unsafe fixture cleanup');
-  await rm(resolved, { recursive: true, force: true });
+  // Windows can hold a folder for a moment after a git process that used it exits (EBUSY), so removal retries.
+  await rm(resolved, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 async function repository(name = 'project') {
@@ -58,6 +72,15 @@ describe('selected-root repository discovery', () => {
     expect(await readFile(indexPath)).toEqual(before);
     expect((await lstat(indexPath)).mtimeMs).toBe(beforeInfo.mtimeMs);
     expect(result.delta.added).toEqual([found.id]);
+  });
+
+  it('classifies a Codex hook file as a tool-settings/hooks kind, like the other tools’ hook files (WS5-02)', async () => {
+    const repo = await repository();
+    await mkdir(join(repo, '.codex'), { recursive: true });
+    await writeFile(join(repo, '.codex', 'hooks.json'), '{"hooks":{}}');
+    const result = await discoverRepositories([fixture]);
+    const found = result.repositories[0]!.instructions.find(file => file.path === '.codex/hooks.json');
+    expect(found).toMatchObject({ tool: 'codex', kind: 'hooks' });
   });
 
   it('deduplicates overlapping roots and keeps nested repositories separate', async () => {
@@ -132,16 +155,23 @@ describe('selected-root repository discovery', () => {
     expect(cancelled.coverage.issues).toContain('cancelled');
   });
 
-  it('does not spend the shared entry budget walking a repository\'s ordinary loose objects', async () => {
+  // The fixture is 3000 real files (well over the 2000-entry budget it asserts against), so it is not
+  // shrunk. It timed out at the default 10 seconds while other test runs kept the machine busy (MG-40,
+  // 2026-09-24) and takes about 2 seconds alone; most of the time under load is process start-up for the
+  // git commands, which a smaller fixture would not save. Each fanout folder's files are now written
+  // together and the limit is 60 seconds. Every assertion below is unchanged.
+  it('does not spend the shared entry budget walking a repository\'s ordinary loose objects', { timeout: 60_000 }, async () => {
     const repo = await repository();
     const objectCount = 3000;
     let created = 0;
     for (let fanout = 0; fanout < 256 && created < objectCount; fanout++) {
       const dir = join(repo, '.git', 'objects', fanout.toString(16).padStart(2, '0'));
       await mkdir(dir, { recursive: true });
+      const writes: Promise<void>[] = [];
       for (let file = 0; file < Math.ceil(objectCount / 256) && created < objectCount; file++, created++) {
-        await writeFile(join(dir, file.toString(16).padStart(38, '0')), Buffer.from([0x78, 0x01, 0x00]));
+        writes.push(writeFile(join(dir, file.toString(16).padStart(38, '0')), Buffer.from([0x78, 0x01, 0x00])));
       }
+      await Promise.all(writes);
     }
     const result = await discoverRepositories([fixture], { limits: { maxEntries: 2000 } });
     expect(result.coverage.status).toBe('complete');
@@ -231,5 +261,71 @@ describe('selected-root repository discovery', () => {
     await expect(canonicalizeRoot(parse(fixture).root)).rejects.toMatchObject({ code: 'invalid-root' });
     await expect(canonicalizeRoot(join(fixture, 'missing'))).rejects.toMatchObject({ code: 'unavailable-root' });
     await expect(discoverRepositories([fixture], { limits: { maxEntries: 30_001 } })).rejects.toMatchObject({ code: 'invalid-limits' });
+  });
+});
+
+describe('protected system, profile and application-data roots (WS1-27)', () => {
+  platformSuite({ only: 'win32', why: 'it checks the Windows system, Program Files and profile folder rules on Windows paths' }); // skipped elsewhere WITH this written reason (FD-06)
+  it('refuses the Windows system folder and its subfolders', async () => {
+    const windowsLike = join(fixture, 'windows-like');
+    await mkdir(join(windowsLike, 'System32'), { recursive: true });
+    await withEnv({ WINDIR: windowsLike }, async () => {
+      await expect(canonicalizeRoot(windowsLike)).rejects.toMatchObject({ code: 'system-root' });
+      await expect(canonicalizeRoot(join(windowsLike, 'System32'))).rejects.toMatchObject({ code: 'system-root' });
+    });
+  });
+
+  it('refuses installed-application (Program Files) folders', async () => {
+    const programFilesLike = join(fixture, 'program-files-like');
+    await mkdir(join(programFilesLike, 'SomeApp'), { recursive: true });
+    await withEnv({ ProgramFiles: programFilesLike }, async () => {
+      await expect(canonicalizeRoot(join(programFilesLike, 'SomeApp'))).rejects.toMatchObject({ code: 'program-files-root' });
+    });
+  });
+
+  it('refuses the Users folder and other accounts’ profiles, but still allows the current account’s own subfolders', async () => {
+    const usersLike = join(fixture, 'Users');
+    const home = join(usersLike, 'me');
+    const otherProfile = join(usersLike, 'other-person');
+    const ownProject = join(home, 'Documents', 'code', 'app');
+    await mkdir(ownProject, { recursive: true });
+    await mkdir(otherProfile, { recursive: true });
+    await withEnv({ USERPROFILE: home }, async () => {
+      await expect(canonicalizeRoot(usersLike)).rejects.toMatchObject({ code: 'user-profile-root' });
+      await expect(canonicalizeRoot(otherProfile)).rejects.toMatchObject({ code: 'other-profile-root' });
+      await expect(canonicalizeRoot(ownProject)).resolves.toBe(ownProject);
+    });
+  });
+
+  it('refuses AppData folders and Agent Town’s own private data folder', async () => {
+    const appDataLike = join(fixture, 'AppData-like');
+    const localAppDataLike = join(fixture, 'LocalAppData-like');
+    const agentTownData = join(localAppDataLike, 'AgentTown');
+    const otherApp = join(localAppDataLike, 'SomeOtherApp');
+    await mkdir(join(agentTownData, 'credentials'), { recursive: true });
+    await mkdir(otherApp, { recursive: true });
+    await mkdir(appDataLike, { recursive: true });
+    await withEnv({ APPDATA: appDataLike, LOCALAPPDATA: localAppDataLike }, async () => {
+      await expect(canonicalizeRoot(appDataLike)).rejects.toMatchObject({ code: 'app-data-root' });
+      await expect(canonicalizeRoot(localAppDataLike)).rejects.toMatchObject({ code: 'app-data-root' });
+      await expect(canonicalizeRoot(agentTownData)).rejects.toMatchObject({ code: 'agent-town-data-root' });
+      await expect(canonicalizeRoot(join(agentTownData, 'credentials'))).rejects.toMatchObject({ code: 'agent-town-data-root' });
+      // A sibling app's own AppData folder is not one of the specifically protected locations.
+      await expect(canonicalizeRoot(otherApp)).resolves.toBeTruthy();
+    });
+  });
+
+  it('refuses a custom AGENT_TOWN_DATA_DIR location even outside AppData', async () => {
+    const customData = join(fixture, 'custom-agent-town-data');
+    await mkdir(customData, { recursive: true });
+    await withEnv({ AGENT_TOWN_DATA_DIR: customData }, async () => {
+      await expect(canonicalizeRoot(customData)).rejects.toMatchObject({ code: 'agent-town-data-root' });
+    });
+  });
+
+  it('refuses a root folder named after a reserved build/dependency/tool directory', async () => {
+    const reserved = join(fixture, 'node_modules');
+    await mkdir(reserved, { recursive: true });
+    await expect(canonicalizeRoot(reserved)).rejects.toMatchObject({ code: 'excluded-name-root' });
   });
 });

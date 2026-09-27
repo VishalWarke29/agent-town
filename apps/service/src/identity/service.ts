@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { z } from 'zod';
 import { GitHubDeviceProvider } from './github.js';
 import { IdentityRegistry, defaultApplicationDirectory } from './registry.js';
@@ -296,6 +296,25 @@ export class IdentityService {
   }
 }
 
+/**
+ * A throwaway/scoped instance (AGENT_TOWN_DATA_DIR set — browser tests, a preview run, a restore
+ * rehearsal) must never write tokens or an API key into the owner's real credential vault at
+ * %LOCALAPPDATA%/AgentTownCredentials. AGENT_TOWN_VAULT_DIR is an explicit override, honoured
+ * wherever a caller sets process environment before starting the service (run.ps1 included — a
+ * PowerShell `&` call inherits the parent's environment, no separate wiring needed there). Absent
+ * that, the vault is derived from the same scoped data directory only when AGENT_TOWN_DATA_DIR is
+ * actually set; the owner's normal install (neither var set) keeps its current vault unchanged.
+ */
+export function resolveVaultDirectory(directory?: string): string | undefined {
+  const explicit = process.env.AGENT_TOWN_VAULT_DIR;
+  if (explicit !== undefined) {
+    if (!explicit.trim()) throw new Error('AGENT_TOWN_VAULT_DIR must name a local directory.');
+    return resolve(explicit);
+  }
+  if (process.env.AGENT_TOWN_DATA_DIR && directory) return join(directory, 'credentials');
+  return undefined;
+}
+
 export function createDefaultIdentity(directory?: string, clientId = process.env.AGENT_TOWN_GITHUB_CLIENT_ID, readClientId?: () => string): IdentityService {
-  return new IdentityService({ registry: new IdentityRegistry(join(directory ?? defaultApplicationDirectory(), 'app.sqlite')), vault: new WindowsDpapiVault(), clientId, readClientId });
+  return new IdentityService({ registry: new IdentityRegistry(join(directory ?? defaultApplicationDirectory(), 'app.sqlite')), vault: new WindowsDpapiVault(resolveVaultDirectory(directory)), clientId, readClientId });
 }

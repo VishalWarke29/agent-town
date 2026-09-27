@@ -3,7 +3,7 @@ import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { normalizeCustomEvent, normalizeHook } from './normalize.js';
 import { SPOOL_BYTE_LIMIT, SPOOL_DIRECTORY_LIMIT, SPOOL_EVENT_BYTES, SPOOL_EVENT_LIMIT } from './spool-limits.js';
-import { bridgeConfigSchema, normalizeBridgePaths, resolveHookSource, type SourceDiagnostic } from './source-binding.js';
+import { bridgeConfigSchema, gateEventForCapability, normalizeBridgePaths, readServiceCapabilities, resolveHookSource, type SourceDiagnostic } from './source-binding.js';
 import { normalizeObservationPath, safeHookProjectPath } from './paths.js';
 
 const args = process.argv.slice(2);
@@ -49,29 +49,39 @@ process.stdin.on('end', () => {
       markSourceDiagnostic(!normalized.nativeSessionId ? 'missing-session-id' : 'missing-child-id'); normalized = null;
     }
     if (normalized) {
-      const event = { ...normalized, ...source.fields };
-      const serialized = JSON.stringify(config.version === 2 ? { version: 2, event } : event), eventBytes = Buffer.byteLength(serialized, 'utf8');
-      let entries = 0, scanned = 0, total = 0, limited = false;
-      const directory = opendirSync(config.spoolPath);
-      try {
-        for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
-          if (++scanned > SPOOL_DIRECTORY_LIMIT) { limited = true; break; }
-          if (!/^[a-f0-9-]{36}\.(?:json|tmp)$/.test(entry.name)) continue;
-          const info = lstatSync(join(config.spoolPath, entry.name));
-          if (!info.isFile() || info.isSymbolicLink() || info.nlink > 1) { limited = true; break; }
-          entries++; total += info.size;
-          if (entries >= SPOOL_EVENT_LIMIT || total + eventBytes > SPOOL_BYTE_LIMIT) { limited = true; break; }
-        }
-      } finally { directory.closeSync(); }
-      const full = limited || eventBytes > SPOOL_EVENT_BYTES;
-      if (full) markGap();
-      else {
-        const id = randomUUID(), temporary = join(config.spoolPath, `${id}.tmp`);
+      const merged = { ...normalized, ...source.fields };
+      // Reads fresh every invocation — this process has no memory between hook events. Absent,
+      // unreadable or older than a gated field's required value, this stays null and every optional
+      // field below stays at the baseline every service build has always understood.
+      const capability = readServiceCapabilities(config.spoolPath);
+      const gated = gateEventForCapability(merged, capability);
+      if (gated) {
+        const serialized = JSON.stringify(config.version === 2 ? { version: 2, event: gated } : gated), eventBytes = Buffer.byteLength(serialized, 'utf8');
+        let entries = 0, scanned = 0, total = 0, limited = false;
+        const directory = opendirSync(config.spoolPath);
         try {
-          writeFileSync(temporary, serialized, { flag: 'wx', mode: 0o600, flush: true });
-          renameSync(temporary, join(config.spoolPath, `${id}.json`));
-        } finally { try { unlinkSync(temporary); } catch { /* A successful rename removed the temporary file. */ } }
+          for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+            if (++scanned > SPOOL_DIRECTORY_LIMIT) { limited = true; break; }
+            if (!/^[a-f0-9-]{36}\.(?:json|tmp)$/.test(entry.name)) continue;
+            const info = lstatSync(join(config.spoolPath, entry.name));
+            if (!info.isFile() || info.isSymbolicLink() || info.nlink > 1) { limited = true; break; }
+            entries++; total += info.size;
+            if (entries >= SPOOL_EVENT_LIMIT || total + eventBytes > SPOOL_BYTE_LIMIT) { limited = true; break; }
+          }
+        } finally { directory.closeSync(); }
+        const full = limited || eventBytes > SPOOL_EVENT_BYTES;
+        if (full) markGap();
+        else {
+          const id = randomUUID(), temporary = join(config.spoolPath, `${id}.tmp`);
+          try {
+            writeFileSync(temporary, serialized, { flag: 'wx', mode: 0o600, flush: true });
+            renameSync(temporary, join(config.spoolPath, `${id}.json`));
+          } finally { try { unlinkSync(temporary); } catch { /* A successful rename removed the temporary file. */ } }
+        }
       }
+      // else: this service build doesn't understand this event's kind yet. Nothing is written — not
+      // a failure and not a coverage gap, the same as if the native tool had stayed quiet; a future
+      // service build sees fresh native activity once it restarts with a newer capability file.
     } else if (!source.blocked && !diagnosticRecorded) markGap();
   } catch { if (!diagnosticRecorded) markGap(); /* Observation never changes a native agent's decision. */ }
   process.stdout.write('{}');

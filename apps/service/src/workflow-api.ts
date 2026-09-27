@@ -56,7 +56,11 @@ export function registerWorkflowApi(app: FastifyInstance, dependencies: Dependen
       try {
         const manager = service(store);
         manager.refreshQueueStatus();
-        if (!manager.state().manager.config.enabled) continue;
+        const config = manager.state().manager.config;
+        // "Enabled" alone only permits the explicit Process action. The 30-second timer also
+        // needs "automatic" (default false, and false on any config saved before it existed),
+        // so turning the manager on never sends an existing backlog without another click.
+        if (!config.enabled || config.automatic !== true) continue;
         void track(manager.processManager(`manager-auto:${randomUUID()}`, { automatic: true })).catch(error => {
           if (!(error instanceof WorkflowError)) app.log.error('Manager processing stopped; inspect its saved operation state.');
         });

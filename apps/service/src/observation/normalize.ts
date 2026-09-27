@@ -50,7 +50,11 @@ export function normalizeHook(surface: ToolSurface, eventName: string, input: un
   if (!input || typeof input !== 'object' || Array.isArray(input)) return reject('malformed-payload');
   const data = input as Record<string, unknown>;
   const event = text(data, 'hook_event_name') ?? eventName;
-  let kind = names[event];
+  // REV-22: `event` is external hook payload text. A plain object lookup would return an inherited
+  // member (e.g. Object.prototype.constructor) for a name like "constructor", which is truthy and
+  // would slip past the `!kind` check below as a bogus, non-string "kind". Object.hasOwn keeps this
+  // an ordinary lookup table, never a prototype-chain probe.
+  let kind = Object.hasOwn(names, event) ? names[event] : undefined;
   const childHook = /subagent/i.test(event);
   const rawSession = surface === 'cursor' ? text(data, ...(childHook ? ['parent_conversation_id'] : []), 'conversation_id', 'session_id') : text(data, 'session_id', 'sessionId', 'conversation_id');
   if (!kind) return reject('unsupported-event');

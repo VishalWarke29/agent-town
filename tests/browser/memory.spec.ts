@@ -101,7 +101,8 @@ test('documented manager prices load only on request and never attest quality or
   const price = profilePrice(profile);
   await expect(page.getByLabel('Input price (USD per million tokens)', { exact: true })).toHaveValue(String(price.inputPerMillionMicroUsd / 1000000));
   await expect(page.getByLabel('I checked this model against the quality needed for these summaries', { exact: true })).not.toBeChecked();
-  await expect(page.getByLabel('Enable automatic manager summaries using this account and these limits', { exact: true })).not.toBeChecked();
+  await expect(page.getByLabel('Turn on the manager with this account and these limits', { exact: true })).not.toBeChecked();
+  await expect(page.getByLabel('Also process saved reports automatically every 30 seconds — this spends money without another click', { exact: true })).not.toBeChecked();
   await page.getByRole('combobox', { name: 'Manager model', exact: true }).selectOption('unknown-model');
   await expect(page.getByText(/This model has no reviewed adapter profile/)).toBeVisible();
   await expect(page.getByRole('button', { name: 'Load documented price fields', exact: true })).toHaveCount(0);

@@ -73,3 +73,14 @@ python tests/smoke/dev-launcher-smoke.py --fixture .data/dev-launcher-review --o
 The final smoke passed on 14 September 2026: [sanitized evidence](../../docs/assets/audit/2026-09-15-dev-launcher-smoke-passed.json). It exposed and then verified the fix for an earlier nested npm/concurrently shutdown race; that earlier failed artifact remains separate. The direct development supervisor now asks its owned service to stop through private IPC and waits for exit before replacement or launcher completion.
 
 Vite references checked 14 September 2026: [WebSocket server options](https://vite.dev/config/server-options#server-ws) and [HMR API](https://vite.dev/guide/api-hmr).
+
+## Browse... folder window (Windows only, opens real windows)
+
+`folder-picker-smoke.mjs` starts the folder window helper the way the service does, from a hidden Node process, and an observer process measures the window (visible, in front, keyboard focus, taskbar button) and drives it through UI Automation. A watchdog process kills everything the harness started if the harness dies, and the run ends by checking that no helper is left. Keep your hands off the keyboard and mouse while it runs: a click elsewhere changes which program is in front and spoils that trial.
+
+```
+node tests/smoke/folder-picker-smoke.mjs --plan functional,shots --cond asis --out results.json
+node tests/smoke/folder-picker-smoke.mjs --plan guards,parent,select --cond asis
+```
+
+Plans: `infra`, `control`, `baseline`, `mitigations`, `pwsh`, `functional`, `guards`, `parent`, `select`, `shots`. `--cond asis` uses whatever program is in front (the stand-in "browser" window cannot take the front while a person is using the PC). The helper under test is the script the service ships (`apps/service/src/folder-picker-script.ts`, copied to a temporary file); `--final <file>` tests another script instead. `candidate-*.ps1` in `folder-picker/` are the spike's comparison scripts and are not shipped. The recorded results are in `docs/assets/audit/2026-09-24-folder-picker-spike.json`. The lighter opt-in checks that go through the service's own code are `tests/unit/folder-picker-real.test.ts` and the last test in `tests/unit/folder-picker-api.test.ts` (`AGENT_TOWN_REAL_FOLDER_PICKER=1`).

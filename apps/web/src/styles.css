@@ -5,7 +5,7 @@ html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; color: var(--ink); font-size: 14px; -webkit-font-smoothing: antialiased; }
 button, input, select, textarea { font: inherit; }
 button { cursor: pointer; color: inherit; }
-button:disabled { opacity: .55; cursor: not-allowed; }
+button:disabled, button[aria-disabled='true'] { opacity: .55; cursor: not-allowed; }
 button { -webkit-tap-highlight-color: transparent; }
 button, a, input, select, textarea { outline-offset: 4px; }
 :focus-visible { outline: 2px solid #436b4e; }
@@ -67,6 +67,23 @@ small { font-size: 11px; }
 .label-dot { display: block; width: 5px; height: 5px; border-radius: 50%; }
 .manager-label { color: #4a6348; border-radius: 20px; font-size: 10px; }
 .place-label { display: block; white-space: nowrap; color: #576a48; font-size: 8px; font-weight: 650; letter-spacing: 1.8px; text-shadow: 0 1px #ebefcb; pointer-events: none; }
+/* Always-on labels for the Archive's 3D bodies (tables/stars): unlike .place-label (a faint ground
+   caption), these need to actually be read at a glance, so they get a visible pill like .world-label. */
+.orbit-label { display: inline-flex; align-items: center; white-space: nowrap; gap: 4px; background: #f8f6e7d0; color: #52624d; font-weight: 600; font-size: 10.5px; padding: 3px 8px; border-radius: 6px; border: 1px solid #ffffffb0; box-shadow: 0 2px 6px #384b3614; pointer-events: none; }
+.orbit-label-active { background: #fffbed; border-color: #839573; color: #3d5330; }
+/* The click-to-inspect detail card for one table (Archive's 3D views): every column, which is a
+   primary key, and the one outgoing foreign key if it has one — clicking is "look into it in detail". */
+.orbit-detail { min-width: 168px; max-width: 220px; background: #fffdf3; color: #40503a; border: 1px solid #c9d4b5; border-radius: 8px; padding: 8px 10px; box-shadow: 0 6px 18px #2c3a2226; font-size: 11px; line-height: 1.5; text-align: left; pointer-events: none; }
+.orbit-detail strong { display: block; font-size: 12.5px; color: #2f3c29; }
+.orbit-detail .orbit-detail-meta { display: block; color: #6c7a60; font-size: 10px; margin-bottom: 4px; }
+.orbit-detail ul { list-style: none; margin: 4px 0 0; padding: 0; }
+.orbit-detail li { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.orbit-detail li b { color: #8a6a2f; }
+.orbit-detail .orbit-detail-fk { margin: 6px 0 0; padding-top: 5px; border-top: 1px dashed #c9d4b5; color: #6c7a60; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10px; }
+.orbit-detail .orbit-detail-fk.muted { font-family: inherit; font-style: italic; }
+/* Under the sun's own label: an honest, plain statement when this file's foreign-key list is empty,
+   so "no lines connect these tables" reads as a fact about the data, not a missing feature. */
+.orbit-sun-note { display: block; margin-top: 3px; font-size: 9.5px; font-weight: 500; font-style: italic; color: #7d7a5f; }
 .agent-label { display: flex; align-items: center; gap: 5px; border: 1px solid #fffef3; background: #f8f6e9f2; border-radius: 6px; padding: 5px 8px; color: #455843; font-weight: 600; font-size: 10px; white-space: nowrap; box-shadow: 0 4px 12px #344b3614; }
 .agent-label small { color: #606a55; font-size: 9px; font-weight: 400; }
 .agent-label > span { color: #805f30; }
@@ -182,7 +199,7 @@ small { font-size: 11px; }
 .feature-heading p { font-size: 11px; margin: 0; }
 .field-label { display: block; color: #5a684d; font-size: 10px; margin-bottom: 9px; }
 .segmented { display: flex; gap: 3px; padding: 4px; border: 1px solid #a8b7984d; border-radius: 10px; margin-bottom: 12px; background: #d7e0ca40; }
-.segmented button { flex: 1; border: 0; border-radius: 7px; font-size: 10px; padding: 9px 5px; background: transparent; color: #5b674f; }
+.segmented button { flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; border: 0; border-radius: 7px; font-size: 10px; padding: 9px 5px; background: transparent; color: #5b674f; }
 .segmented button[aria-pressed='true'] { background: #fffdf1; color: #516e42; box-shadow: 0 1px 4px #415a321a; }
 .connection-row { display: flex; align-items: center; gap: 11px; padding: 14px 0; border-bottom: 1px solid var(--line); }
 .provider-mark { display: grid; place-items: center; border-radius: 9px; width: 32px; height: 32px; color: #556b4c; background: #dfe8d5; font-size: 13px; font-weight: 650; }
@@ -253,12 +270,27 @@ td small { display: block; font-size: 10px; color: #5c6950; margin-top: 6px; }
 .toast { position: fixed; z-index: 60; bottom: 86px; left: 50%; transform: translateX(-50%); width: min(490px, calc(100vw - 40px)); display: flex; gap: 15px; justify-content: space-between; align-items: center; padding: 12px 15px; border-radius: 13px; font-size: 12px; }
 .empty { padding: 20px 0; color: #5c694f; font-size: 12px; }
 .workspace-setup { padding-bottom: 26px; margin-bottom: 24px; border-bottom: 1px solid var(--line); }
+/* These headings are only ever focused programmatically (tabIndex=-1, moved to as the next step after
+   sign-in/cancel/advanced-setup); the panel change itself is the visible cue, matching the existing
+   .room-heading h2:focus convention. */
+.workspace-setup h3[tabindex='-1']:focus { outline: none; }
 .setup-form { display: grid; gap: 14px; margin: 20px 0; }
 .setup-form label { display: grid; gap: 7px; font-size: 11px; font-weight: 600; }
 .setup-form input, .setup-form select, .setup-form textarea { width: 100%; min-height: 40px; padding: 9px 11px; border: 1px solid #aab9a0; border-radius: 9px; background: #fcfdf6; color: var(--ink); font-size: 12px; }
 .setup-form textarea { resize: vertical; line-height: 1.6; }
 .setup-form .check-setting { display: flex; align-items: flex-start; gap: 10px; font-weight: 400; line-height: 1.7; }
 .setup-form .check-setting input { width: 16px; min-height: 16px; height: 16px; flex-shrink: 0; margin-top: 3px; accent-color: #46633d; }
+/* "Browse..." folder window (WS1-07). The button sits beside the path field and drops under it, full width,
+   when the drawer is too narrow for both. The field always keeps room to type. */
+.folder-field-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
+.folder-field-row > label { flex: 999 1 13rem; min-width: 0; }
+.folder-browse-button { flex: 1 1 8rem; min-height: 40px; }
+.folder-browse-hint { margin: 0; }
+.folder-browse-live > p { margin: 8px 0 0; }
+.folder-browse-wait { padding: 12px 14px; border-left: 3px solid var(--green); border-radius: 0 10px 10px 0; background: rgb(249 251 240 / 70%); font-size: 12px; overflow-wrap: anywhere; }
+.folder-browse-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.folder-browse-actions .button { flex: 1 1 auto; }
+@media (pointer: coarse) { .folder-browse-button, .folder-browse-actions .button { min-height: 44px; } }
 .workflow-details { border: 1px solid #bec9b3; border-radius: 11px; padding: 14px; margin: 18px 0 24px; }
 .workflow-details summary { font-size: 12px; line-height: 1.7; font-weight: 600; cursor: pointer; }
 .hook-actions { margin-top: 18px; }
@@ -306,8 +338,15 @@ td small { display: block; font-size: 10px; color: #5c6950; margin-top: 6px; }
 .form-error, .form-notice { padding: 11px 12px; border-radius: 9px; font-size: 12px; overflow-wrap: anywhere; }
 .form-error { background: #f7e8dc; color: #823e29; border: 1px solid #d9b69d; }
 .form-notice { background: #e2ead6; color: #3f5a37; }
+.setup-not-configured { display: grid; gap: 4px; }
+.setup-not-configured .setup-actions { margin: 14px 0 10px; }
+.setup-not-configured > .button { width: fit-content; }
+.setup-advanced { margin-top: 16px; border: 1px solid #bec9b3; border-radius: 11px; padding: 14px; }
+.setup-advanced summary { font-size: 12px; font-weight: 600; cursor: pointer; }
+.setup-advanced[open] summary { margin-bottom: 4px; }
 .device-flow { display: grid; justify-items: start; gap: 13px; border: 1px solid #b8c5aa; border-radius: 12px; padding: 18px; }
 .device-flow p { margin: 0; font-size: 12px; }
+.device-flow .subheading { margin: 0; font-size: 15px; }
 .device-code { font-family: Consolas, monospace; font-size: 23px; letter-spacing: 3px; color: #365438; }
 .signed-in { display: flex; align-items: center; gap: 10px; padding: 14px 0; }
 .signed-in > div { flex: 1; min-width: 0; }
@@ -340,8 +379,32 @@ td small { display: block; font-size: 10px; color: #5c6950; margin-top: 6px; }
 .candidate-row strong { font-size: 12px; }
 .candidate-row small { font-size: 10px; line-height: 1.7; color: #53614b; margin-top: 4px; }
 .instruction-card { padding: 12px 0; border-bottom: 1px solid var(--line); }
-.instruction-card code, .instruction-card small { display: block; font-size: 10px; line-height: 1.8; overflow-wrap: anywhere; }
+.repository-vault { margin-top: 20px; }
+.vault-panel { border: 1px solid var(--line); border-radius: 10px; margin-bottom: 10px; background: rgb(249 251 240 / 65%); }
+.vault-toggle { display: flex; align-items: center; gap: 8px; width: 100%; padding: 12px 14px; background: none; border: none; cursor: pointer; text-align: left; font: inherit; color: inherit; }
+.vault-body { padding: 0 14px 14px; display: grid; gap: 10px; }
+.vault-enable { display: grid; gap: 8px; max-width: 420px; }
+.vault-enable label, .vault-body label { display: grid; gap: 4px; font-size: 11px; color: var(--muted); }
+.vault-enable input, .vault-body input[type="text"], .vault-body input[type="password"] { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font-size: 12px; }
+.vault-file-list { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
+.vault-file-list li { padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.vault-file-list li:last-child { border-bottom: none; }
+.vault-file-list label { display: flex; align-items: baseline; gap: 8px; cursor: pointer; }
+.vault-file-list input { margin: 0; accent-color: #486a3e; flex-shrink: 0; }
+.vault-file-path { font-family: var(--mono, monospace); font-size: 11px; overflow-wrap: anywhere; flex: 1; }
+.vault-file-meta { font-size: 10px; color: #53614b; white-space: nowrap; }
+.vault-file-blocked { background: rgb(197 68 53 / 8%); }
+.vault-finding { display: flex; align-items: flex-start; gap: 6px; margin: 6px 0 0; font-size: 11px; color: #a3402f; }
+.vault-restore { display: grid; gap: 8px; max-width: 420px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.vault-backup-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.vault-backup-list li { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; }
+.vault-backup-list small { display: block; color: #53614b; margin-top: 2px; }
+.instruction-card code, .instruction-card small { display: block; font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
 .instruction-card small { color: #59684f; }
+.instruction-groups section + section { margin-top: 20px; }
+.instruction-groups h4 { font-size: 12px; margin: 0 0 6px; }
+.instruction-groups h4 .muted { font-size: 11px; font-weight: 400; }
+.instruction-tracking-tag { color: #6e603a !important; }
 .observation-setup { padding-bottom: 24px; margin-bottom: 24px; border-bottom: 1px solid var(--line); }
 .native-tracking { padding: 1px 0 16px; margin-bottom: 18px; border-bottom: 1px solid var(--line); }
 .native-tracking h4, .observation-setup > h4 { margin: 22px 0 10px; line-height: 1.5; }
@@ -366,6 +429,44 @@ td small { display: block; font-size: 10px; color: #5c6950; margin-top: 6px; }
 .hook-preview li { margin-bottom: 9px; overflow-wrap: anywhere; }
 .setup-code-label { display: grid; gap: 8px; font-size: 11px; font-weight: 600; margin: 18px 0 8px; }
 .setup-code { resize: vertical; min-height: 70px; width: 100%; padding: 11px; border: 1px solid #b1bea5; border-radius: 9px; font-family: Consolas, monospace; font-size: 10px; line-height: 1.7; white-space: pre; overflow: auto; background: #fbfcf4; color: #36482f; }
+pre.setup-code { margin: 12px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; resize: none; max-height: 15rem; overflow: auto; }
+.tracking-panel { margin: 0 0 20px; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+.tracking-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+.tracking-head h3 { margin: 0; font-size: 12px; font-weight: 500; }
+.tracking-head strong { font-weight: 650; }
+.tracking-panel .text-button { min-height: 28px; }
+.tracking-summary { margin: 0 0 12px; font-size: 10px; color: #5e6754; }
+.tool-rows { display: grid; gap: 8px; margin-bottom: 16px; }
+.tool-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 11px; border: 1px solid #80936c12; background: #fffff447; border-radius: 6px; }
+.tool-mark { width: 24px; height: 24px; border-radius: 7px; display: grid; place-items: center; font-size: 10px; font-weight: 650; flex-shrink: 0; color: #48603f; background: #dfe8d5; }
+.tool-mark.b { color: #6a4f34; background: #eddfcd; }
+.tool-mark.c { color: #4f5749; background: #e2e5db; }
+.tool-mark.d { color: #574c66; background: #e4e1e9; }
+.tool-main { flex: 1 1 11rem; min-width: 0; }
+.tool-name { display: block; font-size: 11px; font-weight: 600; }
+.tool-detail { display: flex; align-items: center; gap: 6px; margin-top: 3px; font-size: 10px; color: #5e6754; overflow-wrap: anywhere; }
+.tool-next { display: block; margin: 4px 0 0; font-size: 10px; line-height: 1.5; color: #4c6047; overflow-wrap: anywhere; }
+.tool-review .tool-next { margin-top: 10px; }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.status-dot.found, .status-dot.live { background: #6f925a; box-shadow: 0 0 0 3px #88a9671c; }
+.status-dot.amber { background: transparent; border: 1.5px solid #b59760; }
+.status-dot.off, .status-dot.grey { background: transparent; border: 1.5px solid #bcc6b6; }
+.status-dot.pending { background: transparent; border: 1.5px solid #bcc6b6; border-top-color: transparent; }
+.setup-anyway { flex-shrink: 0; min-height: 28px; font-size: 10px; font-weight: 650; color: #466a48; background: transparent; border: 0; padding: 4px 0 4px 10px; }
+.tool-review-list .review-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
+.tool-review-list .review-head h4 { margin: 0; font-size: 12px; font-weight: 600; }
+.tool-review-list fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+.review-note { margin: 4px 0 16px; font-size: 10px; color: #5e6754; }
+.tool-review { border: 1px solid #bec9b3; border-radius: 12px; background: #f7f9ee; padding: 15px; margin-bottom: 12px; }
+.tool-review-head { display: flex; align-items: flex-start; gap: 10px; cursor: pointer; }
+.tool-review-head .checkbox { margin-top: 2px; }
+.checkbox { accent-color: #46633d; width: 16px; height: 16px; flex-shrink: 0; }
+.tool-review-name, .tool-review-path { display: block; }
+.tool-review-name { font-size: 12px; font-weight: 600; }
+.tool-review-path { margin-top: 3px; font-size: 10px; color: #5e6754; overflow-wrap: anywhere; }
+.tool-review-path code { font-family: Consolas, monospace; color: #36482f; }
+.write-summary { padding: 11px 12px; border-radius: 9px; font-size: 11px; background: #e2ead6; color: #3f5a37; margin: 4px 0 16px; overflow-wrap: anywhere; }
+.write-summary code { font-family: Consolas, monospace; font-size: 10px; }
 .stale-tag { display: inline-block; color: #775326; background: #f0e4ca; border: 1px solid #cbb58c; border-radius: 5px; padding: 2px 5px; margin-left: 5px; font-size: 9px; }
 .status-idle, .status-offline, .status-cancelled { color: #59664f; background: #e6eadc; }
 .status-failed { color: #863f29; background: #f5e4d7; }
@@ -384,11 +485,23 @@ td small { display: block; font-size: 10px; color: #5c6950; margin-top: 6px; }
 @keyframes arrive { from { opacity: 0; translate: 0 8px; } to { opacity: 1; translate: 0 0; } }
 @media (prefers-reduced-motion: reduce) { *, *::before { animation: none !important; transition: none !important; } }
 @media (max-width: 1150px) { .brand { min-width: 0; } .preview-badge { display: none; } .world-intro { left: 105px; bottom: 110px; } .camera-hint { display: none; } .brand-subtitle { letter-spacing: 1.5px; font-size: 7px; } .brand-name { font-size: 23px; } }
-@media (max-width: 899px) { .topbar { left: 20px; right: 20px; top: 20px; gap: 12px; } .workspace-pill { margin-left: auto; } .workspace-pill > span:not(.workspace-avatar) { display: none; } .workspace-pill { padding: 8px; gap: 6px; } .workspace-pill .workspace-avatar { width: 28px; height: 28px; } .drawer-left, .drawer-right { width: min(420px, calc(100vw - 32px)); top: 88px; bottom: 80px; right: 16px; left: auto; } .world-footer { left: 20px; right: 20px; bottom: 18px; } .tool-dock { left: 20px; } .world-intro { left: 96px; bottom: 120px; width: 265px; } .world-intro h1 { font-size: 26px; } .footer-separator { display: none; } .list-view { inset: 90px 86px 88px; padding: 24px; } table { font-size: 11px; } td:nth-child(2), th:nth-child(2) { display: none; } }
-@media (max-width: 560px) { .topbar { inset: 16px 16px auto; gap: 8px; flex-wrap: wrap; } .brand-mark { width: 37px; height: 37px; border-radius: 12px; } .brand { gap: 8px; } .brand-name { font-size: 21px; } .brand-subtitle { display: none; } .workspace-pill { display: none; } .top-actions { gap: 7px; margin-left: auto; } .button.compact { padding: 9px 10px; min-height: 36px; font-size: 10px; } .top-actions > .icon-button { width: 35px; height: 35px; } .tool-dock { left: 14px; padding: 5px; border-radius: 14px; gap: 4px; top: 46%; } .tool-dock .icon-button { width: 32px; height: 34px; } .world-intro { left: 22px; bottom: 139px; width: 245px; } .world-intro h1 { font-size: 25px; } .world-intro .eyebrow { font-size: 8px; } .world-intro p:not(.eyebrow) { font-size: 11px; } .world-footer { left: 14px; right: 14px; bottom: 16px; align-items: end; } .connection-pill { font-size: 9px; max-width: 175px; padding: 10px; text-align: left; line-height: 1.4; } .connection-dot { flex-shrink: 0; } .camera-controls { gap: 0; padding: 3px; } .camera-controls .icon-button { width: 30px; height: 31px; } .camera-controls .icon-button svg { width: 16px; } .drawer-left, .drawer-right { top: 73px; bottom: 69px; border-radius: 17px; } .drawer-content { padding-left: 21px; padding-right: 21px; } .drawer-header { padding: 19px 16px 16px 21px; } .drawer-header h2 { font-size: 24px; } .list-view { inset: 74px 12px 70px; padding: 19px; } .list-heading h1 { font-size: 24px; } .list-heading .eyebrow { font-size: 7px; letter-spacing: 1px; } .list-heading .sample-tag { display: none; } td { padding: 17px 5px; } td small { font-size: 9px; } .toast { bottom: 75px; } }
+@media (max-width: 899px) { .topbar { left: 20px; right: 20px; top: 20px; gap: 12px; } .workspace-pill { margin-left: auto; } .workspace-pill > span:not(.workspace-avatar) { display: none; } .workspace-pill { padding: 8px; gap: 6px; } .workspace-pill .workspace-avatar { width: 28px; height: 28px; } .drawer-left, .drawer-right { width: min(420px, calc(100vw - 32px)); top: 88px; bottom: 80px; right: 16px; left: auto; } .world-footer { left: 20px; right: 20px; bottom: 18px; } .tool-dock { left: 20px; } .world-intro { left: 96px; bottom: 120px; width: 265px; } .world-intro h1 { font-size: 26px; } .footer-separator { display: none; } .list-view { inset: 90px 86px 88px; padding: 24px; } table { font-size: 11px; }
+  /* Every field stays reachable at narrow widths as a labelled row instead of a hidden column
+     (REV-08): thead is visually hidden (not display:none, so its <th> text stays in the accessibility
+     tree) and each <td> grows its own visible label from the data-label attribute App.tsx sets. */
+  .list-view table, .list-view tbody, .list-view tr, .list-view td { display: block; width: 100%; }
+  .list-view thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+  .list-view tbody tr { margin-bottom: 12px; padding: 10px 12px; border: 1px solid #acbc9945; border-radius: 10px; background: #fffff447; }
+  .list-view td { padding: 6px 0; border-bottom: 0; }
+  .list-view td[data-label]::before { content: attr(data-label) ':'; display: block; margin-bottom: 3px; font-size: 9px; font-weight: 650; text-transform: uppercase; letter-spacing: .4px; color: #5e6754; }
+}
+@media (max-width: 560px) { .topbar { inset: 16px 16px auto; gap: 8px; flex-wrap: wrap; } .brand-mark { width: 37px; height: 37px; border-radius: 12px; } .brand { gap: 8px; } .brand-name { font-size: 21px; } .brand-subtitle { display: none; } .workspace-pill { display: none; } .top-actions { gap: 7px; margin-left: auto; } .button.compact { padding: 9px 10px; min-height: 36px; font-size: 10px; } .top-actions > .icon-button { width: 35px; height: 35px; } .tool-dock { left: 14px; padding: 5px; border-radius: 14px; gap: 4px; top: 46%; } .tool-dock .icon-button { width: 32px; height: 34px; } .world-intro { left: 22px; bottom: 139px; width: 245px; } .world-intro h1 { font-size: 25px; } .world-intro .eyebrow { font-size: 8px; } .world-intro p:not(.eyebrow) { font-size: 11px; } .world-footer { left: 14px; right: 14px; bottom: 16px; align-items: end; } .connection-pill { font-size: 9px; max-width: 175px; padding: 10px; text-align: left; line-height: 1.4; } .connection-dot { flex-shrink: 0; } .camera-controls { gap: 0; padding: 3px; } .camera-controls .icon-button { width: 30px; height: 31px; } .camera-controls .icon-button svg { width: 16px; } .drawer-left, .drawer-right { top: 73px; bottom: 69px; border-radius: 17px; } .drawer-content { padding-left: 21px; padding-right: 21px; } .drawer-header { padding: 19px 16px 16px 21px; } .drawer-header h2 { font-size: 24px; } .list-view { inset: 74px 12px 70px; padding: 19px; } .list-heading { flex-wrap: wrap; } .list-heading h1 { font-size: 24px; } .list-heading .eyebrow { font-size: 7px; letter-spacing: 1px; } td { padding: 17px 5px; } td small { font-size: 9px; } .toast { bottom: 75px; } }
 @media (max-width: 560px) {
-  .tool-dock { top: auto; bottom: 76px; left: 14px; transform: none; flex-direction: row; gap: 3px; }
-  .tool-dock .dock-divider, .tool-dock [aria-label='Open repositories'], .tool-dock [aria-label='Open tasks'] { display: none; }
+  /* Every dock destination (Repositories and Tasks included) must stay reachable at phone width; a
+     horizontally scrollable row keeps them all instead of hiding two of the seven icons (REV-08). */
+  .tool-dock { top: auto; bottom: 76px; left: 14px; right: 14px; transform: none; flex-direction: row; gap: 3px; max-width: calc(100vw - 28px); overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; }
+  .tool-dock::-webkit-scrollbar { display: none; }
+  .tool-dock .icon-button { flex-shrink: 0; }
   .world-intro { top: 83px; left: 24px; bottom: auto; width: calc(100vw - 48px); padding-top: 10px; }
   .world-intro h1 { font-size: 24px; margin: 5px 0 8px; }
   .world-intro .eyebrow { display: none; }
@@ -406,6 +519,14 @@ td small { display: block; font-size: 10px; color: #5c6950; margin-top: 6px; }
 .list-navigation .button { font-size: 11px; padding: 8px 10px; }
 
 .room-context { position: fixed; z-index: 29; top: 98px; left: 50%; transform: translateX(-50%); width: min(650px, calc(100vw - 205px)); padding: 14px 18px; border-radius: 16px; color: #344c39; }
+/* A left and/or right drawer sits above the room header at z-index 40 and can otherwise cover its
+   "Back to town" button between roughly 1280 and 1536px wide. Pull the header's own box clear of
+   whichever drawer is actually open instead of guessing a single fixed width (REV-08). */
+@media (min-width: 900px) {
+  .town-app:has(.drawer-right[open]) .room-context { left: auto; right: 463px; transform: none; width: min(560px, calc(100vw - 483px - 343px)); }
+  .town-app:has(.drawer-left[open]) .room-context { left: 363px; transform: none; }
+  .town-app:has(.drawer-left[open]):has(.drawer-right[open]) .room-context { width: min(560px, calc(100vw - 363px - 483px)); }
+}
 .room-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
 .room-heading > div { min-width: 0; }
 .room-heading h2 { font-size: 23px; overflow-wrap: anywhere; margin: 3px 0; }
@@ -419,6 +540,13 @@ td small { display: block; font-size: 10px; color: #5c6950; margin-top: 6px; }
 .room-pages > span:last-child { display: flex; gap: 6px; }
 .room-pages .button { padding: 6px 9px; }
 .room-back { margin-bottom: 18px; min-height: 44px; }
+/* H0-07: the house inspector's fixed slot order (facts, Assign, Residents, then Details and Watch sessions
+   last). The lede and the interim Assign line are new text (12px, never colour-only). Details and Watch are
+   plain spacing wrappers, not a new collapse layer: see RepositoryInspector's own comment in App.tsx for why. */
+.house-lede { margin: 0 0 16px; font-size: 12px; line-height: 1.6; color: #445140; }
+.assign-slot { margin: 0 0 20px; padding: 10px 12px; border: 1px dashed var(--line); border-radius: 8px; font-size: 12px; color: #5e6754; }
+.inspector-slot { margin: 0 0 20px; }
+.inspector-watch:last-child { margin-bottom: 0; }
 .repository-agents { margin-bottom: 24px; }
 .repository-agents .section-summary h3 { display: flex; align-items: center; gap: 7px; }
 .repository-agents .agent-row { border-color: #61795433; background: #f8faefb3; margin-bottom: 7px; }
@@ -535,4 +663,31 @@ td small { display: block; font-size: 10px; color: #5c6950; margin-top: 6px; }
 /* Keep overlapping text out of mobile glass drawers without unmounting the room. */
 @media (max-width: 899px) {
   .room-context[inert], .list-view[inert] { visibility: hidden; }
+}
+
+/* A drawer's header, tabs and footer are a fixed cost; at short or zoomed viewports (max-height: 560px)
+   they used to eat all but a ~24px content slit at 640x360 and 844x390, and the List view collapsed the
+   same way (A11Y-1, RV-1; WCAG 1.4.10 reflow, 1.4.4 zoom). Appended AFTER the width rules above (:451,
+   :461, :603) on purpose: same-specificity width rules win the cascade only by coming later in the file,
+   so this block has to follow them to take effect at the widths they share (UX-04).
+   This is the verifier-checked "variant B" from .data/ui-audit/verify-4523/probe.mjs: the audit's first
+   attempt narrowed .list-layout's inset for every width at max-height:560 and broke the List view at
+   ordinary desktop widths; variant B leaves the List alone above 699px and only offsets it below that,
+   where the drawer's own top offset already frees the space. The footer's "zero AI calls" line is an
+   Economy-relevant fact, so it survives lower than the header/eyebrow trim: down to 420px, not just 560. */
+@media (max-height: 560px) {
+  .drawer-left, .drawer-right { top: 76px; bottom: 8px; }
+  .drawer-header .eyebrow { display: none; }
+  .drawer-header { padding: 10px 14px 6px 16px; }
+  .drawer-header h2 { font-size: 18px; margin-top: 2px; }
+  .drawer-toolbar { padding-bottom: 6px; }
+}
+@media (max-height: 560px) and (max-width: 899px) {
+  .drawer-left, .drawer-right { top: 8px; }
+}
+@media (max-height: 560px) and (max-width: 699px) {
+  .list-layout { top: 74px; bottom: 64px; }
+}
+@media (max-height: 420px) {
+  .drawer-footer { display: none; }
 }

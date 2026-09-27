@@ -11,6 +11,8 @@ import { IdentityError } from './identity/types.js';
 import { CommandError, initialState } from './demo.js';
 import { applyStatePatch, createStatePatch, type StatePatch } from './ops/patches.js';
 import { NativeInventory } from './observation/native-inventory.js';
+import { LATEST_WORKSPACE_VERSION, migrationBackupVersion } from './storage-registry.js';
+import { introspectOpenDatabase } from './db-visualizer.js';
 
 export const projectRoot = fileURLToPath(new URL('../../../', import.meta.url));
 export interface StoreLimits { maxEvents: number; maxEventBytes: number; maxReceipts: number; maxPinnedReceipts: number }
@@ -50,10 +52,10 @@ export class Store {
     try {
       this.sqlite.pragma('journal_mode = WAL'); this.sqlite.pragma('busy_timeout = 5000'); this.sqlite.pragma('trusted_schema = OFF');
       const version = this.sqlite.pragma('user_version', { simple: true });
-      if (typeof version !== 'number' || version > 4) throw new Error('This workspace database requires a newer Agent Town version.');
+      if (typeof version !== 'number' || version > LATEST_WORKSPACE_VERSION) throw new Error('This workspace database requires a newer Agent Town version.');
       // VACUUM INTO includes committed WAL data and does not copy a potentially stale main file.
-      if (existed && version < 4) {
-        const backup = `${path}.before-v${version < 2 ? 2 : version < 3 ? 3 : 4}.bak`;
+      if (existed && version < LATEST_WORKSPACE_VERSION) {
+        const backup = `${path}.before-v${migrationBackupVersion(version)}.bak`;
         if (!existsSync(backup)) this.sqlite.prepare('VACUUM INTO ?').run(backup);
         this.verifyMigrationBackup(backup);
       }
@@ -120,6 +122,12 @@ export class Store {
 
   private currentRow(): StateRow { return this.sqlite.prepare('SELECT cursor,data FROM town_state WHERE id=?').get(this.workspaceId) as StateRow; }
   private baseline(): StateRow { return this.sqlite.prepare('SELECT cursor,data FROM event_baseline WHERE id=?').get(this.workspaceId) as StateRow; }
+
+  /** Read-only schema/row-count introspection of this workspace's own already-open connection: no
+   * second file handle, no new lock. Never returns row content. Used by the database visualizer. */
+  dbSchemaGroup() {
+    return introspectOpenDatabase(this.sqlite, this.preview ? "Sample town data (this workspace)" : "This workspace's data", 'workspace');
+  }
 
   snapshot(): Snapshot {
     const row = this.currentRow();

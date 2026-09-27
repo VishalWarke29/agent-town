@@ -69,7 +69,7 @@ async function loadFixture(page: Page, snapshot: Snapshot) {
   });
   await page.route('**/api/v1/workspaces/demo-town/snapshot', route => route.fulfill({ json: snapshot }));
   await page.goto('/?preview=1');
-  await expect(page.getByText('Demo mode · local service connected', { exact: true })).toBeVisible();
+  await expect(page.getByText('Sample town · local service connected', { exact: true })).toBeVisible();
   await expect(page.locator('canvas')).toBeVisible();
   expect(mutations).toEqual(['POST /api/v1/session']);
   mutations.length = 0;

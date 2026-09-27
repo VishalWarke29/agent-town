@@ -37,6 +37,8 @@ export const managerConfigSchema = z.object({
   maxOutputTokens: z.number().int().min(256).max(1200),
   maxInputTokens: z.number().int().min(1024).max(32000),
   requestBudgetMicroUsd: money,
+  /** Missing on configs saved before this flag existed; treat as false (explicit-only). The 30-second timer requires enabled AND automatic; the explicit Process action needs only enabled. */
+  automatic: z.boolean().optional(),
 }).strict();
 export type ManagerConfig = z.infer<typeof managerConfigSchema>;
 
@@ -118,7 +120,9 @@ export interface ManagerProposal {
 export interface WorkflowState {
   schemaVersion: 1; connections: WorkflowConnection[]; defaults: Record<string, string>;
   policy: EconomyPolicy; reservations: BudgetReservation[];
-  manager: { config: ManagerConfig; queueReportIds: string[]; jobs: ManagerJob[]; versions: ContextVersion[]; proposals: ManagerProposal[]; automaticStarts: string[]; waitingStatus?: ManagerQueueStatus };
+  manager: { config: ManagerConfig; queueReportIds: string[]; jobs: ManagerJob[]; versions: ContextVersion[]; proposals: ManagerProposal[]; automaticStarts: string[]; waitingStatus?: ManagerQueueStatus;
+    /** Set once, the first time the manager is enabled. Reports saved before this moment are excluded from automatic and queued processing until a reviewed way to include them exists. Missing on state saved before this field existed, which is treated the same as null (no exclusion). */
+    baselineAt?: string | null };
 }
 export const managerResultSchema = z.object({
   overview: z.string().min(1).max(8000),

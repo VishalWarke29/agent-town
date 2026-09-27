@@ -35,7 +35,7 @@ function fixture() {
   const state = privateState(workspace), now = '2026-09-14T00:00:00.000Z';
   state.agents = [initialState(now).agents[0]];
   state.agents[0].observation = { connectionId: 'native-source', sessionId: 'fixture-session', parentSessionId: null, lastSequence: 2, sourceTime: now, freshness: 'current', billing: 'unavailable' };
-  state.workflow = initialWorkflow(); state.workflow.policy.paidEnabled = true; state.workflow.manager.config.enabled = true;
+  state.workflow = initialWorkflow(); state.workflow.policy.paidEnabled = true; state.workflow.manager.config.enabled = true; state.workflow.manager.config.automatic = true; state.workflow.manager.baselineAt = now;
   state.workflow.connections = [{ id: 'api-fixture', provider: 'openai', mode: 'api', label: 'Fixture', status: 'verified', verifiedAt: now, createdAt: now, accountIdentity: 'unavailable', models: ['fixture'], capabilities: { manager: true, managedExecution: true } }];
   state.workflow.reservations = [{ id: 'budget-record', runId: 'run-fixture', purpose: 'worker', connectionId: 'api-fixture', provider: 'openai', mode: 'api', model,
     amountMicroUsd: 400, runBudgetMicroUsd: 400, actualMicroUsd: null, usage: null, status: 'reserved', day: '2026-09-14', createdAt: now, settledAt: null, settlementSource: null }];
@@ -110,6 +110,7 @@ describe('offline recovery', () => {
       const saved = store.snapshot().state;
       expect(saved.handoffs[0].summary).toContain('Saved report'); expect(saved.manager).toMatchObject({ version: 2, brief: 'Accepted design and saved context.' });
       expect(saved.workflow!.policy.paidEnabled).toBe(false); expect(saved.workflow!.connections[0].status).toBe('disconnected');
+      expect(saved.workflow!.manager.config.automatic).toBe(false); expect(saved.workflow!.manager.baselineAt).toBeNull();
       expect(saved.workflow!.reservations[0]).toMatchObject({ amountMicroUsd: 400, actualMicroUsd: null, status: 'uncertain' });
       expect(saved.workflow!.manager.jobs[0].completedAt).toBeTruthy();
       expect(saved.runner!.runs[0]).toMatchObject({ status: 'interrupted', contextDelivery: 'provider-acknowledged' });
@@ -131,6 +132,37 @@ describe('offline recovery', () => {
     const reclaimed = acquireDataDirectoryLock(item.source); reclaimed();
     writeFileSync(join(item.source, '.agent-town.lock'), '{broken');
     expect(() => acquireDataDirectoryLock(item.source)).toThrow('in use');
+    expect(() => acquireDataDirectoryLock(item.source)).toThrow(/unreadable.*delete it/);
+  });
+
+  it('reclaims a lock whose process ID was recycled, and names the file and process when it refuses', () => {
+    const item = fixture(), lock = join(item.source, '.agent-town.lock'), hours = (count: number) => new Date(Date.now() - count * 3_600_000).toISOString();
+    // The live process (this one) is far newer than a lock written yesterday, so the number was reused by an unrelated process.
+    writeFileSync(lock, JSON.stringify({ version: 1, pid: process.pid, operation: 'service', nonce: 'old', startedAt: hours(48) }));
+    acquireDataDirectoryLock(item.source)();
+    // Another live process (here the parent) started later than the lock: also recycled.
+    writeFileSync(lock, JSON.stringify({ version: 1, pid: process.ppid, operation: 'service', nonce: 'old', startedAt: hours(1) }));
+    acquireDataDirectoryLock(item.source, 'service', () => Date.now())();
+    // A genuine owner began before it wrote its lock, so the lock stays and the refusal is specific.
+    writeFileSync(lock, JSON.stringify({ version: 1, pid: process.ppid, operation: 'service', nonce: 'live', startedAt: hours(1) }));
+    expect(() => acquireDataDirectoryLock(item.source, 'service', () => Date.now() - 2 * 3_600_000)).toThrow(new RegExp(`process ${process.ppid}, started .*\\.agent-town\\.lock.*delete that file`));
+    // When the process age cannot be determined the lock is kept rather than guessed at.
+    expect(() => acquireDataDirectoryLock(item.source, 'service', () => undefined)).toThrow(`process ${process.ppid}`);
+    writeFileSync(lock, JSON.stringify({ version: 1, pid: process.ppid, operation: 'service', nonce: 'no-time' }));
+    expect(() => acquireDataDirectoryLock(item.source, 'service', () => Date.now())).toThrow('in use');
+    expect(readFileSync(lock, 'utf8')).toContain('no-time');
+    // A dead owner is still reclaimed without probing anything.
+    writeFileSync(lock, JSON.stringify({ version: 1, pid: 2147483647, operation: 'service', nonce: 'dead', startedAt: hours(1) }));
+    acquireDataDirectoryLock(item.source, 'service', () => { throw new Error('Not consulted for a dead process.'); })();
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  it('explains an abandoned reclaim guard instead of a generic in-use message', () => {
+    const item = fixture(), lock = join(item.source, '.agent-town.lock');
+    writeFileSync(lock, JSON.stringify({ version: 1, pid: 2147483647, operation: 'service', nonce: 'dead', startedAt: new Date().toISOString() }));
+    writeFileSync(`${lock}.reclaim`, '');
+    expect(() => acquireDataDirectoryLock(item.source)).toThrow(/Stop Agent Town.*in use.*interrupted.*delete .*\.agent-town\.lock\.reclaim/);
+    expect(existsSync(lock)).toBe(true);
   });
 
   it('rejects corruption, path traversal, and active state even when a changed file has a new checksum', async () => {
@@ -146,6 +178,41 @@ describe('offline recovery', () => {
     manifest.files[0].path = 'app.sqlite'; writeFileSync(join(item.backup, 'manifest.json'), JSON.stringify(manifest));
     writeFileSync(join(item.backup, 'app.sqlite'), Buffer.alloc(50));
     await expect(validateBackup(item.backup)).rejects.toMatchObject({ code: 'invalid-backup' });
+  });
+
+  it('REV-22: rejects a backup whose saved state was keyed by __proto__/prototype/constructor, and restores fine when those are only VALUES', async () => {
+    const item = fixture(); await createOfflineBackup(item.source, item.backup);
+    const path = `workspaces/${item.workspace.id}/town.sqlite`, database = new Database(join(item.backup, path));
+    const row = database.prepare('SELECT data FROM town_state').get() as { data: string }, state = JSON.parse(row.data);
+    // Plain assignment (state.workflow.__proto__ = ...) would invoke Object.prototype's __proto__
+    // SETTER and swap the live prototype instead of creating an own key — JSON.stringify would then
+    // silently drop it. Object.defineProperty creates a genuine own, enumerable "__proto__" data
+    // property, exactly what a JSON.parse of an attacker-supplied blob containing that key produces.
+    Object.defineProperty(state.workflow, '__proto__', { value: { polluted: true }, enumerable: true, configurable: true, writable: true });
+    database.prepare('UPDATE town_state SET data=?').run(JSON.stringify(state)); database.close(); reseal(item.backup, path);
+    await expect(validateBackup(item.backup)).rejects.toMatchObject({ code: 'invalid-backup' });
+    await expect(restoreOfflineBackup(item.backup, item.restored)).rejects.toMatchObject({ code: 'invalid-backup' });
+    expect(existsSync(item.restored)).toBe(false);
+
+    const valuesOnly = fixture();
+    const withValues = new Store(valuesOnly.database, privateState(valuesOnly.workspace));
+    try {
+      withValues.commit('proto-named-repo', current => {
+        current.repositories.push({ id: 'repo-proto', name: '__proto__', description: '', branch: 'main', language: '', color: '#abc', position: [2, 2], source: 'local', localPath: join(valuesOnly.root, 'proto-project') });
+        current.handoffs.push({ id: 'handoff-proto', repoId: 'repo-proto', agentId: 'external', summary: 'constructor', createdAt: new Date().toISOString(), status: 'saved', contextVersion: null, delivery: 'unsupported' });
+        return 'observation.native_fixture';
+      });
+    } finally { withValues.close(); }
+    await createOfflineBackup(valuesOnly.source, valuesOnly.backup);
+    await expect(validateBackup(valuesOnly.backup)).resolves.toBeTruthy();
+    await restoreOfflineBackup(valuesOnly.backup, valuesOnly.restored);
+    const restored = new Store(join(valuesOnly.restored, 'private', 'workspaces', valuesOnly.workspace.id, 'town.sqlite'), privateState(valuesOnly.workspace));
+    try {
+      const restoredState = restored.snapshot().state;
+      expect(restoredState.repositories.find(r => r.id === 'repo-proto')?.name).toBe('__proto__');
+      expect(restoredState.handoffs.find(h => h.id === 'handoff-proto')?.summary).toBe('constructor');
+      expect(Object.getPrototypeOf(restoredState)).toBe(Object.prototype);
+    } finally { restored.close(); }
   });
 
   it.each(['-wal', '-shm', '-journal'])('rejects an unlisted SQLite %s sidecar instead of restoring a different database view', async suffix => {

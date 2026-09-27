@@ -2,15 +2,17 @@ import { Component, useEffect, useMemo, useRef, useState, type ReactNode } from 
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { Html, RoundedBox } from '@react-three/drei';
 import { Mesh, MeshBasicMaterial, PCFShadowMap, Vector3 } from 'three';
-import type { Agent, Repository, TownState } from '@agent-town/contracts';
+import type { Agent, DbSchemaSnapshot, Repository, TownState } from '@agent-town/contracts';
 import { characterTexture } from './sprites';
 import { campusBounds } from './layout';
 import { CameraRig } from './CameraRig';
 import { RepositoryHouse } from './RepositoryHouse';
 import { Character } from './Character';
 import { Block } from './primitives';
+import { ArchiveGraph } from './ArchiveGraph';
+import { ConstellationGraph } from './ConstellationGraph';
 import { roomAgentAnchor } from './room-layout';
-import { canUseDesk, ROOM_PAGE_SIZE, type CameraAction, type RoomView, type Selection } from './interaction';
+import { ARCHIVE_POSITION, ARCHIVE_VISUAL_ELEVATION, canUseDesk, ROOM_PAGE_SIZE, type CameraAction, type RoomView, type Selection } from './interaction';
 
 export type { Selection, CameraAction } from './interaction';
 interface Props {
@@ -27,6 +29,8 @@ interface Props {
   snapshotGeneration: number;
   labelsInteractive?: boolean;
   onUnavailable: () => void;
+  archiveMode: 'none' | 'solar' | 'constellation';
+  dbSchema: DbSchemaSnapshot | null;
 }
 function Tree({ x, z, scale = 1, kind = 0 }: { x: number; z: number; scale?: number; kind?: number }) {
   return <group position={[x, 0, z]} scale={scale}>
@@ -123,6 +127,26 @@ function Manager({ selected, pending, onSelect, active, labelsInteractive }: { s
   </group>;
 }
 
+/** A town-wide building, not a per-project house: it visualizes Agent Town's own local database,
+ * never a connected project's. "House" is fixed by decision to mean one area of a project, so this
+ * is deliberately a different kind of building, placed once in the town rather than beside a
+ * repository. Shows a text chip only, like an unopened house, until selected. */
+function Archive({ selected, onSelect, active, labelsInteractive }: { selected: boolean; onSelect: () => void; active: boolean; labelsInteractive: boolean }) {
+  return <group position={[ARCHIVE_POSITION[0], 0, ARCHIVE_POSITION[1]]} name="archive">
+    <mesh position={[0, 0.055, 0.3]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow><circleGeometry args={[1.7, 24]} /><meshStandardMaterial color={selected ? '#e2ceae' : '#cabf9f'} /></mesh>
+    <group onClick={event => { event.stopPropagation(); onSelect(); }}>
+      <Block position={[0, 0.4, 0]} size={[1.5, 0.8, 1.5]} color="#8a7c63" />
+      <Block position={[0, 0.95, 0]} size={[1.2, 0.3, 1.2]} color="#a4967a" />
+      <Block position={[0, 1.2, 0]} size={[0.9, 0.2, 0.9]} color="#8a7c63" />
+      <Block position={[0.55, 0.4, 0.76]} size={[0.05, 0.5, 0.05]} color="#5f5544" />
+      <Block position={[-0.55, 0.4, 0.76]} size={[0.05, 0.5, 0.05]} color="#5f5544" />
+    </group>
+    {active && <Html position={[0, 1.9, 0]} center zIndexRange={[15, 1]} style={{ pointerEvents: labelsInteractive ? 'auto' : 'none' }}>
+      <button className={`world-label ${selected ? 'selected' : ''}`} tabIndex={labelsInteractive ? 0 : -1} onClick={onSelect}>◈ Archive</button>
+    </Html>}
+  </group>;
+}
+
 function ServicePulse({ repo, receivedAt, reduced }: { repo: Repository; receivedAt: string; reduced: boolean }) {
   const mesh = useRef<Mesh>(null), material = useRef<MeshBasicMaterial>(null);
   const received = Date.parse(receivedAt);
@@ -170,6 +194,13 @@ function Scene(props: Props) {
       return received ? <ServicePulse key={`traffic-${repo.id}`} repo={repo} receivedAt={received} reduced={props.reducedMotion} /> : null;
     })}
     <Manager pending={props.state.handoffs.filter(h => h.status === 'saved').length} selected={props.selection?.kind === 'manager'} active={props.active} labelsInteractive={props.labelsInteractive ?? true} onSelect={() => props.onSelect({ kind: 'manager' })} />
+    <Archive selected={props.selection?.kind === 'archive'} active={props.active} labelsInteractive={props.labelsInteractive ?? true} onSelect={() => props.onSelect({ kind: 'archive' })} />
+    {/* Floats above the building, not beside it: this world's ground is already packed with houses,
+        trees and paths at this scale, and the orbiting solar system's own footprint would overlap
+        them at ground level. Hovering it clear of every roofline keeps it readable and reads as "a
+        projection coming from the Archive," not a new ground obstacle. */}
+    {props.archiveMode === 'solar' && props.dbSchema && <ArchiveGraph snapshot={props.dbSchema} origin={[ARCHIVE_POSITION[0], ARCHIVE_VISUAL_ELEVATION, ARCHIVE_POSITION[1]]} />}
+    {props.archiveMode === 'constellation' && props.dbSchema && <ConstellationGraph snapshot={props.dbSchema} origin={[ARCHIVE_POSITION[0], ARCHIVE_VISUAL_ELEVATION, ARCHIVE_POSITION[1]]} />}
     {props.state.agents.map(agent => {
       const belongsToRoom = roomRepo?.id === agent.repoId;
       const deskIndex = belongsToRoom && canUseDesk(agent) ? props.room!.agentIds.slice(0, ROOM_PAGE_SIZE).indexOf(agent.id) : -1;
@@ -177,7 +208,7 @@ function Scene(props: Props) {
       const source = props.state.observation?.connections.find(connection => connection.id === agent.observation?.connectionId);
       return <Character key={agent.id} agent={agent} slot={reportingSlots.get(agent.id) ?? 0} selected={props.selection?.kind === 'agent' && props.selection.id === agent.id} onSelect={() => props.onSelect({ kind: 'agent', id: agent.id })} reduced={props.reducedMotion} connected={props.connected && source?.status !== 'revoked'} active={props.active} now={now} snapshotGeneration={props.snapshotGeneration} repositories={props.state.repositories} positions={positions} textures={textures.get(agent.color)!} deskAnchor={deskAnchor} deskIndex={deskIndex >= 0 ? deskIndex : undefined} hidden={belongsToRoom && canUseDesk(agent) && !deskAnchor} labelsInteractive={props.labelsInteractive ?? true} />;
     })}
-    <CameraRig action={props.cameraAction} follow={props.follow} onStopFollow={props.onStopFollow} positions={positions} reducedMotion={props.reducedMotion} active={props.active} />
+    <CameraRig action={props.cameraAction} follow={props.follow} onStopFollow={props.onStopFollow} positions={positions} reducedMotion={props.reducedMotion} active={props.active} rotatable={props.archiveMode !== 'none'} />
   </>;
 }
 

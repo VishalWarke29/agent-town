@@ -10,7 +10,7 @@ import {
   type DiscoveredRepository, type DiscoveryIssue, type DiscoveryLimits, type DiscoveryOptions, type DiscoveryResult,
 } from './types';
 
-export { canonicalizeRoot, isWithin } from './paths';
+export { assertSafeProjectRoot, canonicalizeRoot, isWithin } from './paths';
 export * from './types';
 export { inspectLocalProject, localRepositoryId, type LocalProjectDirectory } from './local-project';
 

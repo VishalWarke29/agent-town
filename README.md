@@ -2,7 +2,7 @@
 
 A little interactive world for your coding agents.
 
-**The local foundation includes private workspaces, discovery, observation, API monitoring, Economy controls and reviewed managed tasks.** See the [implementation status](docs/17-implementation-status.md) for current delivery and remaining gates, and [house exploration verification](docs/31-house-exploration-verification.md) for the interactive workrooms. Real provider and sandbox verification remain pending. Paid work starts disabled.
+**The local foundation includes private workspaces, discovery, observation, API monitoring and Economy controls — each Built and covered by automated (fixture) checks; real native-tool events and real provider/sandbox execution are Built, not yet verified.** See the [implementation status](docs/17-implementation-status.md) for current delivery and remaining gates, [the capability matrix](docs/records/evidence/capability-matrix.md) for the claim-to-evidence table, and [house exploration verification](docs/31-house-exploration-verification.md) for the interactive workrooms. Managed task execution stays Excluded by design on this computer until the installed runtime passes its restricted-read boundary check (see [managed execution](docs/23-managed-execution.md)). Paid work starts disabled.
 
 Add your IDs later using the numbered [account setup guide](docs/24-connect-your-accounts.md). The prepared `agent-town.config.json` accepts your public GitHub Client ID and optional application mode; provider keys go through protected connection forms.
 
@@ -41,7 +41,9 @@ The sample town is optional: choose **Explore sample town** to open it. **Exit s
 
 Both glass drawers start closed. They overlay the same full-screen world. List view provides the same sample actions without using the scene.
 
-For real work, sign in, create a private workspace, select local repositories, and prepare observation hooks in Connections. Received tool events create characters automatically. API-funded workers and Codex subscription tasks use separate, explicit connection modes. Preflight blocks unsupported execution environments.
+For real work, sign in, create a private workspace, and add local project folders; each project gets a house. Watching a tool's sessions is a separate, optional step: prepare an observation hook in Connections, and events the tool sends after that, or sessions you choose to show in town, create characters. Watching is Built and covered by automated checks, but a real event from each installed tool is not yet recorded as evidence (see [the capability matrix](docs/records/evidence/capability-matrix.md)). Connecting a project reads no sessions on its own (item H0-02, checked in the source 2026-09-25): a check of this computer's installed tools starts only when you press **Check this computer** in Repository details, and it writes nothing until you review and apply its proposed hooks. API-funded workers and Codex subscription tasks are separate, explicit connection modes; both are Excluded by design on this computer while preflight blocks the installed execution environment.
+
+**Planned change (plan v5, 24 September 2026, [docs/44](docs/44-houses-first-master-plan.md)).** Watching will be an explicit per-project opt-in with a Stop watching action, a project's houses will be its areas, and tasks will be assigned through a chat that hands the exact text to your own tool; none of that is built yet. (Connecting a project already reads no sessions on its own, described above — item H0-02.) Agent Town does not sign in to the Claude, ChatGPT, Cursor or Copilot tools you run yourself and does not use their subscriptions for its own AI calls; each tool keeps its own sign-in. The one exception in the current build is Agent Town's own isolated Codex sign-in under Connections, which is separate from your Codex, powers no task on this computer and is frozen until the owner decides.
 
 Documentation and screenshots stay on this computer. `AGENTS.md` (including lowercase spelling) and `docs/` are excluded by `.gitignore` at the owner's request.
 
@@ -94,7 +96,7 @@ Browser checks use installed Microsoft Edge by default. Set `AGENT_TOWN_BROWSER=
 - `%LOCALAPPDATA%\AgentTownCredentials`: Windows-protected secrets, outside ordinary backups.
 - `docs`: the product plan, architecture, roadmap, and implementation evidence.
 
-Sample reports use a deterministic manager template. Private manager processing uses an explicitly enabled, bounded API request. Monitoring, source parsing, scene interaction, and reading saved details use zero model inference. Unknown usage stays unresolved; the app never silently switches accounts or upgrades models.
+Sample reports use a deterministic manager template. Private manager processing uses an explicitly enabled, bounded API request with an API key you enter (Built, not yet verified with a real model); running the manager on a Claude or ChatGPT plan is Planned only, by hand-off in your own tool. Monitoring, source parsing, scene interaction, and reading saved details use zero model inference. Unknown usage stays unresolved; the app never silently switches accounts or upgrades models.
 
 Native integration coverage and sandbox compatibility vary by installed tool. Subscription allowance is not an app-enforced dollar budget. Native Codex API and Claude SDK modes stay blocked when their internal requests cannot satisfy the required controls; the separate bounded API workers are explicit choices. See [managed execution](docs/23-managed-execution.md).
 

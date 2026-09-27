@@ -3,7 +3,7 @@ import { DatabaseBackup, RefreshCw } from 'lucide-react';
 import type { BackupStatus } from '@agent-town/contracts';
 import type { IdentityController } from './useIdentity';
 
-interface RuntimeHealth { applicationMode: string; sourceHotReload: boolean; build?: { id: string; builtAt: string | null }; servedWeb?: { entry: string | null; buildId: string | null; builtAt: string | null } }
+interface RuntimeHealth { applicationMode: string; sourceHotReload: boolean; build?: { id: string; builtAt: string | null }; servedWeb?: { entry: string | null; buildId: string | null; builtAt: string | null }; bridge?: { buildId: string | null; builtAt: string | null }; rebuiltPendingRestart?: boolean }
 export function OperationsPanel({ identity, available }: { identity: IdentityController; available: boolean }) {
   const [health, setHealth] = useState<RuntimeHealth | null>(null);
   const [backup, setBackup] = useState<BackupStatus | null>(null);
@@ -23,7 +23,8 @@ export function OperationsPanel({ identity, available }: { identity: IdentityCon
   }, [identity.read]);
   return <section className="setup-form" aria-label="Local runtime and backups">
     <h3 className="subheading">Local runtime</h3>
-    <dl className="facts"><div><dt>Environment</dt><dd>{health?.applicationMode ?? 'Unavailable'}</dd></div><div><dt>Backend build</dt><dd className="mono">{health?.build?.id ?? 'Unavailable'}</dd></div><div><dt>Served web build</dt><dd className="mono">{health?.servedWeb?.buildId ?? 'Unavailable'}</dd></div><div><dt>Web entry</dt><dd className="mono">{health?.servedWeb?.entry ?? 'Unavailable'}</dd></div><div><dt>Source refresh</dt><dd>{health ? health.sourceHotReload ? 'Development hot reload' : 'Restart after building changes' : 'Unavailable'}</dd></div></dl>
+    {health?.rebuiltPendingRestart && <p className="form-notice" role="status">Agent Town was rebuilt. Restart it to use the new version.</p>}
+    <dl className="facts"><div><dt>Environment</dt><dd>{health?.applicationMode ?? 'Unavailable'}</dd></div><div><dt>Backend build</dt><dd className="mono">{health?.build?.id ?? 'Unavailable'}</dd></div><div><dt>Served web build</dt><dd className="mono">{health?.servedWeb?.buildId ?? 'Unavailable'}</dd></div><div><dt>Web entry</dt><dd className="mono">{health?.servedWeb?.entry ?? 'Unavailable'}</dd></div><div><dt>Hook bridge build</dt><dd className="mono">{health?.bridge?.buildId ?? 'Unavailable'}</dd></div><div><dt>Source refresh</dt><dd>{health ? health.sourceHotReload ? 'Development hot reload' : 'Restart after building changes' : 'Unavailable'}</dd></div></dl>
     <p className="muted small">Use <code>.\run.ps1 -Dev</code> for automatic source refresh. Normal startup serves a built copy. Production mode currently uses this computer only.</p>
     <h3 className="subheading"><DatabaseBackup size={18} /> Recovery copies</h3>
     {error && <p className="form-error" role="status">{error}</p>}

@@ -42,7 +42,7 @@ export function classifyInstruction(relativePath: string): InstructionKind | nul
     tool === 'claude' && ['settings.json', 'settings.local.json'].includes(lower)
     || tool === 'codex' && lower === 'config.toml'
   )) return { tool, kind: 'settings', scope: toolScope };
-  if (tail.length === 1 && lower === 'hooks.json' && ['claude', 'cursor'].includes(tool)) return { tool, kind: 'hooks', scope: toolScope };
+  if (tail.length === 1 && lower === 'hooks.json' && ['claude', 'cursor', 'codex'].includes(tool)) return { tool, kind: 'hooks', scope: toolScope };
   if (tool === 'copilot' && tail.length === 1 && lower === 'copilot-instructions.md') return { tool, kind: 'instructions', scope: toolScope };
   if (tail[0] === 'agents' && /\.(md|toml)$/u.test(lower)) return { tool, kind: 'agent', scope: toolScope };
   if (tail[0] === 'skills' && lower === 'skill.md') return { tool, kind: 'skill', scope: toolScope };

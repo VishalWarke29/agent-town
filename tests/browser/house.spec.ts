@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
-import type { Agent, Snapshot, TownState } from '@agent-town/contracts';
+import type { Agent, Repository, Snapshot, TownState } from '@agent-town/contracts';
 import { initialState } from '../../apps/service/src/demo';
 import { OrthographicCamera, Vector3 } from 'three';
 import { roomAgentAnchor } from '../../apps/web/src/world/room-layout';
@@ -499,4 +499,119 @@ test('reporting frees its desk without shifting other residents or closing an in
   await expect(roster(page).locator('[data-agent-id="stable-a"]')).toContainText(/report/i);
   expect(state.handoffs[0]!.status).toBe('saved'); expect(state.manager.version).toBe(0);
   expect(evidence.mutations).toEqual([]); expect(evidence.remote).toEqual([]); expect(evidence.errors).toEqual([]);
+});
+
+// H0-07: the house inspector's fixed slot order. A freshly connected Git project (its background check
+// has not finished) exercises the "Not checked yet" wording; DES-02 section 1 fixes the order itself.
+function inspectorRepo(): Repository {
+  const checkedAt = new Date().toISOString();
+  return {
+    id: 'inspector', name: 'Inspector project', description: 'Checks the reordered house inspector.', language: 'TypeScript', branch: 'Unavailable', color: '#728c80', position: [-6, -3.7],
+    source: 'local', projectKind: 'git', localPath: String.raw`C:\fixture\inspector-project`, selectedRoot: String.raw`C:\fixture`,
+    scan: { at: checkedAt, coverage: 'partial', reasons: ['git-metadata-not-scanned'] },
+    discoveryStatus: { state: 'stale', checkedAt, lastVerifiedAt: null, reasons: ['git-metadata-not-scanned'] },
+    git: { availability: 'unavailable', head: null, changedFiles: null, untrackedFiles: null, reason: 'git-metadata-not-scanned' },
+    instructions: [],
+  };
+}
+
+test('the house inspector orders facts, the Assign line, residents, details, then Watch sessions collapsed — matching tab order, axe and no request before Watch is opened', async ({ page }, testInfo) => {
+  const state = houseState(), repo = inspectorRepo(), worker = resident('inspector-worker', repo.id);
+  state.repositories = [repo]; state.agents = [worker];
+  const requests: string[] = [];
+  page.on('request', request => { const path = new URL(request.url()).pathname; if (path.startsWith('/api/')) requests.push(`${request.method()} ${path}`); });
+  const evidence = await fixture(page, state);
+  // fixture() only clears its own `mutations`; the initial GET .../snapshot that useTown.ts makes while
+  // establishing the connection (before any house is even opened) is a startup request, not one caused by
+  // opening the inspector below.
+  requests.length = 0;
+  const viewport = page.viewportSize()!;
+  const focusedLabel = () => page.evaluate(() => { const el = document.activeElement as HTMLElement | null; return el?.getAttribute('aria-label') ?? el?.textContent?.trim() ?? el?.tagName ?? null; });
+
+  await page.getByRole('button', { name: repo.name, exact: true }).click();
+  await settle(page);
+  const opener = page.getByRole('button', { name: 'Repository details', exact: true });
+  await opener.click();
+  const drawer = page.getByTestId('right-drawer');
+  await expect(drawer).toBeVisible();
+
+  // 1) DOM/visual order: facts, Assign, Residents, Details, then Watch sessions (optional) last.
+  const slots = drawer.locator('[data-slot]');
+  await expect(slots).toHaveCount(5);
+  expect(await slots.evaluateAll(nodes => nodes.map(node => node.getAttribute('data-slot')))).toEqual(['facts', 'assign', 'residents', 'details', 'watch']);
+
+  // 2) Facts, Assign and Residents are open on arrival. Details and Watch sessions (optional) keep the
+  // content this build already has: an unscanned project's Details has no focusable control of its own
+  // (checked next in the tab walk), and Watch's existing panel keeps its detail rows collapsed behind its own
+  // "Show details" toggle while its header stays visible (houses-first.spec.ts and local-folder.spec.ts pin
+  // that header being reachable without an extra click; H0-07 only moves it below Details).
+  await expect(drawer.locator('.house-lede')).toBeVisible();
+  await expect(drawer.getByText('Task hand-off: planned, not built yet', { exact: true })).toBeVisible();
+  await expect(drawer.getByRole('button', { name: `Inspect ${worker.name}`, exact: true })).toBeVisible();
+  await expect(drawer.locator('[data-slot="details"]')).toContainText(repo.description);
+  const tracking = drawer.getByRole('region', { name: /^Live tracking:/ });
+  await expect(tracking).toBeVisible();
+  await expect(tracking.getByRole('button', { name: 'Show details', exact: true })).toHaveAttribute('aria-expanded', 'false');
+
+  // 3) Never an invented 0/none: an unscanned Git project reads "Not checked yet", not "0" or "found".
+  // Pins the Details slot's instruction-files empty state specifically (not just a drawer-wide substring
+  // check) so a regression back to the old, dishonest "no supported instruction files were found" copy
+  // — which implies a completed scan that never ran — would fail here even if some other field elsewhere
+  // in the drawer still happened to contain the words "Not checked yet".
+  await expect(drawer).toContainText('Not checked yet');
+  await expect(drawer).not.toContainText('No supported instruction files were found');
+  await expect(drawer.locator('[data-slot="details"] .empty')).toHaveText('Not checked yet. Scan selected folders to check for instruction files.');
+
+  // 4) Nothing above Watch has sent a request; Watch itself, still collapsed and with no saved connection
+  // for this project, has sent none either (it only polls /health once a connection exists).
+  await page.waitForTimeout(500);
+  expect(requests).toEqual([]);
+
+  // 5) Keyboard-only path, tab order equal to reading order: Close -> Back to repository -> (facts and the
+  // Assign line have no stop) -> the resident search -> the resident row -> (Details has no focusable control
+  // for this unscanned project) -> Watch's own toggle.
+  await expect.poll(focusedLabel).toBe('Close details');
+  await page.keyboard.press('Tab'); await expect.poll(focusedLabel).toBe('Back to repository');
+  await page.keyboard.press('Tab'); await expect.poll(focusedLabel).toBe('Find a repository agent');
+  await page.keyboard.press('Tab'); await expect.poll(focusedLabel).toBe(`Inspect ${worker.name}`);
+  await page.keyboard.press('Tab'); await expect.poll(focusedLabel).toBe('Show details');
+  expect(requests).toEqual([]);
+
+  // 6) axe: clean on the built screen (not just the design prototype).
+  const axeResult = await new AxeBuilder({ page }).include('[data-testid="right-drawer"]').withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze();
+  expect(axeResult.violations.map(violation => ({ id: violation.id, nodes: violation.nodes.map(node => node.target) }))).toEqual([]);
+  await page.screenshot({ path: testInfo.outputPath(`inspector-order-${testInfo.project.name}.png`) });
+
+  // 7) No horizontal scroll at 320px.
+  await page.setViewportSize({ width: 320, height: 844 });
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath(`inspector-order-320-${testInfo.project.name}.png`) });
+  await page.setViewportSize(viewport);
+
+  // 8) Closing returns focus to the opener.
+  await page.getByRole('button', { name: 'Close details', exact: true }).click();
+  await expect(drawer).toHaveCount(0);
+  await expect(opener).toBeFocused();
+
+  // 9) The same inspector, with the same facts line, opens from the List view room header.
+  await page.getByRole('button', { name: 'Show list view', exact: true }).click();
+  await opener.click();
+  await expect(drawer.locator('.house-lede')).toHaveText('No sessions were scanned and no agent has started. Agent Town checks this folder and its Git status in the background; the facts below fill in when the first check ends.');
+  await page.keyboard.press('Escape');
+
+  expect(evidence.errors).toEqual([]);
+});
+
+test('sample houses say Sample and have no Watch slot', async ({ page }) => {
+  await page.goto('/?preview=1');
+  // UX-05's own already-landed wording for the sample-town pill (not "Local service connected", which
+  // is the non-demo string) — see tests/browser/town.spec.ts and startup.spec.ts for the same string.
+  await expect(page.getByText('Sample town · local service connected', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Web studio', exact: true }).click();
+  await page.getByRole('button', { name: 'Repository details', exact: true }).click();
+  const drawer = page.getByTestId('right-drawer');
+  await expect(drawer).toBeVisible();
+  await expect(page.getByText('REPOSITORY · SAMPLE', { exact: true })).toBeVisible();
+  expect(await drawer.locator('[data-slot]').evaluateAll(nodes => nodes.map(node => node.getAttribute('data-slot')))).toEqual(['facts', 'assign', 'residents', 'details']);
+  await expect(drawer.getByRole('region', { name: /^Live tracking:/ })).toHaveCount(0);
 });

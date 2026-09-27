@@ -9,6 +9,9 @@ export * from './telemetry.js';
 export * from './runner.js';
 export * from './placement.js';
 export * from './history.js';
+export * from './folder-picker.js';
+export * from './db-visualizer.js';
+export * from './vault.js';
 
 export const DEMO_WORKSPACE = 'demo-town';
 export const demoCommandSchema = z.discriminatedUnion('action', [
@@ -40,7 +43,9 @@ export interface Repository {
   git?: { availability: 'available' | 'unavailable'; head: string | null; changedFiles: number | null; untrackedFiles: number | null; reason?: string };
   instructions?: InstructionFile[];
 }
-export interface InstructionFile { path: string; tool: string; scope: string; size: number; modifiedAt: string; hash: string | null; appliedToRun: false }
+/** `kind` is optional so a repository record saved before WS5-02 still loads: the drawer falls back to
+ * a filename-based guess when it is missing, and a later scan fills it in. */
+export interface InstructionFile { path: string; tool: string; scope: string; size: number; modifiedAt: string; hash: string | null; appliedToRun: false; kind?: 'instructions' | 'rules' | 'agent' | 'skill' | 'settings' | 'hooks' }
 export interface WorkspaceSummary { id: string; name: string; kind: 'personal' | 'company' }
 export interface PublicUser { id: string; login: string; displayName: string | null; avatarUrl: string | null }
 export type ApplicationMode = 'demo' | 'development' | 'production';
@@ -123,6 +128,7 @@ export interface TownState {
   workflow?: WorkflowState;
   telemetry?: TelemetryState;
   runner?: import('./runner.js').RunnerState;
+  vault?: import('./vault.js').VaultState;
   simulation: { running: boolean; step: number };
   repositories: Repository[];
   agents: Agent[];

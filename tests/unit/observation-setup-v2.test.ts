@@ -4,11 +4,12 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import type { ObservationEvent } from '@agent-town/contracts';
+import { SERVICE_CAPABILITIES_FILE, hookOverlapConflicts, surfaceSchema, type ObservationEvent, type ToolSurface } from '@agent-town/contracts';
+import { IdentityError } from '../../apps/service/src/identity/types';
 import { normalizeHook } from '../../apps/service/src/observation/normalize';
 import { normalizeObservationPath, observationPathWithin, safeHookProjectPath, sameObservationPath } from '../../apps/service/src/observation/paths';
-import { bridgeConfigPath, changeHooks, inspectObservationSetup, observationSetup, spoolPath, writeBridgeConfig } from '../../apps/service/src/observation/setup';
-import { bridgeConfigSchema, parseSpoolEvent, resolveHookSource, type BridgeConfig } from '../../apps/service/src/observation/source-binding';
+import { bridgeConfigPath, changeHooks, inspectObservationSetup, observationSetup, spoolPath, writeBridgeConfig, __setRenameForTests } from '../../apps/service/src/observation/setup';
+import { bridgeConfigSchema, hasAmbiguousHookOverlap, parseSpoolEvent, resolveHookSource, type BridgeConfig } from '../../apps/service/src/observation/source-binding';
 import type { RegisteredObservation } from '../../apps/service/src/observation/registry';
 import { drainObservationSpool } from '../../apps/service/src/observation/spool';
 import { privateState } from '../../apps/service/src/workspaces';
@@ -22,6 +23,7 @@ afterEach(() => {
     if (!remainder || remainder.startsWith('..') || isAbsolute(remainder) || !target.includes('agent-town-observation-v2-')) throw new Error('Unsafe fixture cleanup');
     rmSync(target, { recursive: true, force: true });
   }
+  __setRenameForTests(null);
 });
 
 function fixture(provider: RegisteredObservation['connection']['provider'] = 'codex') {
@@ -29,11 +31,16 @@ function fixture(provider: RegisteredObservation['connection']['provider'] = 'co
   const root = join(directory, 'project'), home = join(directory, 'native-home'); mkdirSync(root); mkdirSync(home);
   const record: RegisteredObservation = { ownerId: 'fixture-owner', workspaceId: 'fixture-workspace', repoPath: root, nativeHome: home,
     connection: { id: randomUUID(), provider, repoId: 'fixture-repo', label: 'Fixture', status: 'unverified', createdAt: new Date().toISOString(), lastEventAt: null, version: null, coverage: 'partial', droppedEvents: 0, nativeSourceId: sourceId, sourceRevision: 3, binding: 'resolved' } };
-  const vault = { available: true, get: async () => null, put: async () => {}, delete: async () => {} };
+  // Refuses what the real vault refuses (an empty value, or one over 16,000 bytes: H0-10), so no test here can store a backup the real vault would not.
+  const vault = { available: true, get: async () => null, put: async (_reference: string, value: string) => { if (!value || Buffer.byteLength(value) > 16_000) throw new IdentityError('credential_invalid', 'Invalid protected credential value.'); }, delete: async () => {} };
   const config = (): Extract<BridgeConfig, { version: 2 }> => ({ version: 2, connectionId: record.connection.id, provider, repoPath: root, spoolPath: spoolPath(directory, record.connection.id), nativeSourceId: sourceId, sourceRevision: 3, binding: 'resolved', nativeHome: home });
   return { directory, root, home, record, vault, config };
 }
 
+/** Every connection's spool now permanently carries its capability file (WS3-23) alongside whatever
+ * event or diagnostic marker files a test's own bridge invocation writes; assertions about the
+ * spool's own contents read through it. */
+function spoolEntries(spool: string) { return readdirSync(spool).filter(name => name !== SERVICE_CAPABILITIES_FILE); }
 function writeConfiguration(path: string, value: unknown) {
   mkdirSync(resolve(path, '..'), { recursive: true }); writeFileSync(path, JSON.stringify(value));
 }
@@ -140,10 +147,33 @@ describe('native source identity and backwards-compatible replay', () => {
     const f = fixture(); await writeBridgeConfig(f.record, f.directory);
     const result = await invokeBridge(bridgeConfigPath(f.directory, f.record.connection.id), { cwd: f.root, session_id: 'native-one', hook_event_name: 'Stop', prompt: 'PRIVATE_PROMPT', last_assistant_message: 'Done. api_key=PRIVATE_KEY' }, { CODEX_HOME: f.home });
     expect(result).toEqual({ code: 0, stdout: '{}', stderr: '' });
-    const files = readdirSync(spoolPath(f.directory, f.record.connection.id)); expect(files).toHaveLength(1);
+    const files = spoolEntries(spoolPath(f.directory, f.record.connection.id)); expect(files).toHaveLength(1);
     const serialized = readFileSync(join(spoolPath(f.directory, f.record.connection.id), files[0]!), 'utf8'), envelope = JSON.parse(serialized);
     expect(envelope.version).toBe(2); expect(parseSpoolEvent(envelope)).toMatchObject({ nativeSourceId: sourceId, sourceRevision: 3, nativeSessionId: 'native-one', kind: 'turn.end' });
     expect(serialized).not.toContain('PRIVATE_PROMPT'); expect(serialized).not.toContain('PRIVATE_KEY'); expect(serialized).not.toContain('native-home');
+  });
+
+  it('WS3-23 golden test: a missing or corrupted capability file emits byte-identical event content to a present one, since nothing is gated today', async () => {
+    const f = fixture(); await writeBridgeConfig(f.record, f.directory);
+    const spool = spoolPath(f.directory, f.record.connection.id), capabilityFile = join(spool, SERVICE_CAPABILITIES_FILE);
+    const config = bridgeConfigPath(f.directory, f.record.connection.id);
+    const input = { cwd: f.root, session_id: 'golden-session', hook_event_name: 'Stop', last_assistant_message: 'Golden test response.' };
+    const normalize = (envelope: { event: Record<string, unknown> }) => ({ ...envelope, event: { ...envelope.event, id: 'normalized', occurredAt: 'normalized' } });
+    const runOnce = async () => {
+      expect(await invokeBridge(config, input, { CODEX_HOME: f.home })).toEqual({ code: 0, stdout: '{}', stderr: '' });
+      const [name] = spoolEntries(spool); const path = join(spool, name!);
+      const envelope = JSON.parse(readFileSync(path, 'utf8')); rmSync(path);
+      return normalize(envelope);
+    };
+
+    const withCapability = await runOnce();
+    rmSync(capabilityFile);
+    const withoutCapability = await runOnce();
+    writeFileSync(capabilityFile, 'not valid json{{{');
+    const withCorruptCapability = await runOnce();
+
+    expect(withoutCapability).toEqual(withCapability);
+    expect(withCorruptCapability).toEqual(withCapability);
   });
 
   it('accepts a declared source after its real runtime home matches and isolates another home', () => {
@@ -158,7 +188,7 @@ describe('native source identity and backwards-compatible replay', () => {
     await writeBridgeConfig(f.record, f.directory);
     expect(await invokeBridge(bridgeConfigPath(f.directory, f.record.connection.id), { cwd: f.root, session_id: 'compatible-session', hook_event_name: 'Stop', last_assistant_message: 'PRIVATE_UNATTRIBUTED_REPORT' }, {})).toEqual({ code: 0, stdout: '{}', stderr: '' });
     const spool = spoolPath(f.directory, f.record.connection.id);
-    expect(readdirSync(spool)).toEqual(['source-diagnostic-source-ambiguous']);
+    expect(spoolEntries(spool)).toEqual(['source-diagnostic-source-ambiguous']);
     const state = privateState({ id: 'fixture-workspace', name: 'Fixture', kind: 'personal' }); state.observation = { connections: [f.record.connection] };
     const store = { snapshot: () => ({ cursor: 0, state }), commit: (_id: string, mutate: (current: typeof state, now: string) => unknown) => { mutate(state, new Date().toISOString()); return {}; } } as unknown as Store;
     const received: ObservationEvent[] = [];
@@ -171,7 +201,7 @@ describe('native source identity and backwards-compatible replay', () => {
   it('keeps a v2 native Cursor receipt connection-scoped without inventing its profile', async () => {
     const f = fixture('cursor'); await writeBridgeConfig(f.record, f.directory);
     expect(await invokeBridge(bridgeConfigPath(f.directory, f.record.connection.id), { conversation_id: 'cursor-session', cursor_version: 'fixture', workspace_roots: [f.root], hook_event_name: 'stop' }, {})).toEqual({ code: 0, stdout: '{}', stderr: '' });
-    const spool = spoolPath(f.directory, f.record.connection.id), files = readdirSync(spool);
+    const spool = spoolPath(f.directory, f.record.connection.id), files = spoolEntries(spool);
     expect(files).toContain('source-diagnostic-source-ambiguous');
     const events = files.filter(name => name.endsWith('.json')); expect(events).toHaveLength(1);
     const envelope = JSON.parse(readFileSync(join(spool, events[0]!), 'utf8')), saved = parseSpoolEvent(envelope);
@@ -184,7 +214,7 @@ describe('native source identity and backwards-compatible replay', () => {
     const config = bridgeConfigPath(f.directory, f.record.connection.id);
     writeFileSync(config, JSON.stringify({ version: 1, connectionId: f.record.connection.id, provider, repoPath: f.root, spoolPath: spoolPath(f.directory, f.record.connection.id) }));
     expect(await invokeBridge(config, { cwd: f.root, session_id: 'legacy-native', hook_event_name: 'Stop' }, {})).toEqual({ code: 0, stdout: '{}', stderr: '' });
-    const files = readdirSync(spoolPath(f.directory, f.record.connection.id)); expect(files).toHaveLength(1);
+    const files = spoolEntries(spoolPath(f.directory, f.record.connection.id)); expect(files).toHaveLength(1);
     const saved = JSON.parse(readFileSync(join(spoolPath(f.directory, f.record.connection.id), files[0]!), 'utf8'));
     expect(saved.version).toBeUndefined(); expect(parseSpoolEvent(saved)).toMatchObject({ sessionId: 'legacy-native', kind: 'turn.end' }); expect(saved.nativeSourceId).toBeUndefined();
   });
@@ -194,7 +224,7 @@ describe('native source identity and backwards-compatible replay', () => {
     const cursor = { ...f.record, connection: { ...f.record.connection, provider: 'cursor' as const, id: randomUUID() } };
     writeConfiguration(observationSetup(cursor, f.directory).configPath, JSON.parse(observationSetup(cursor, f.directory).config));
     expect(await invokeBridge(bridgeConfigPath(f.directory, f.record.connection.id), { cwd: f.root, session_id: 'ambiguous-native', hook_event_name: 'Stop', last_assistant_message: 'PRIVATE_AMBIGUOUS_REPORT' }, { CLAUDE_CONFIG_DIR: f.home })).toEqual({ code: 0, stdout: '{}', stderr: '' });
-    const spool = spoolPath(f.directory, f.record.connection.id); expect(readdirSync(spool)).toEqual(['source-diagnostic-hook-overlap']);
+    const spool = spoolPath(f.directory, f.record.connection.id); expect(spoolEntries(spool)).toEqual(['source-diagnostic-hook-overlap']);
     const state = privateState({ id: 'fixture-workspace', name: 'Fixture', kind: 'personal' }); state.observation = { connections: [f.record.connection] };
     const store = { snapshot: () => ({ cursor: 0, state }), commit: (_id: string, mutate: (current: typeof state, now: string) => unknown) => { mutate(state, new Date().toISOString()); return {}; } } as unknown as Store;
     const received: ObservationEvent[] = [];
@@ -210,7 +240,7 @@ describe('native source identity and backwards-compatible replay', () => {
     await expect(changeHooks(f.record, f.directory, f.vault)).rejects.toMatchObject({ code: 'CUSTOM_HOOK_UNSUPPORTED' });
     const event = { id: 'custom-retry-stable', sessionId: 'custom-session', kind: 'report', occurredAt: new Date().toISOString(), nativeSourceId: '00000000-0000-4000-8000-000000000099', sourceRevision: 99, producer: 'codex', summary: 'api_key=PRIVATE_CUSTOM', files: ['src/check.ts', '../outside', '.env'] };
     expect(await invokeBridge(bridgeConfigPath(f.directory, f.record.connection.id), event, {}, true)).toEqual({ code: 0, stdout: '{}', stderr: '' });
-    const files = readdirSync(spoolPath(f.directory, f.record.connection.id)); expect(files).toHaveLength(1);
+    const files = spoolEntries(spoolPath(f.directory, f.record.connection.id)); expect(files).toHaveLength(1);
     const saved = parseSpoolEvent(JSON.parse(readFileSync(join(spoolPath(f.directory, f.record.connection.id), files[0]!), 'utf8')));
     expect(saved).toMatchObject({ id: 'custom-retry-stable', nativeSessionId: 'custom-session', nativeSourceId: sourceId, sourceRevision: 3, producer: 'custom', files: ['src/check.ts'] });
     expect(JSON.stringify(saved)).not.toContain('PRIVATE_CUSTOM');
@@ -226,7 +256,80 @@ describe('native source identity and backwards-compatible replay', () => {
     const store = { snapshot: () => ({ cursor: 0, state }), commit: (_id: string, mutate: (current: typeof state, now: string) => unknown) => { mutate(state, now); return {}; } } as unknown as Store;
     const received: ObservationEvent[] = [];
     await drainObservationSpool({ directory: f.directory, spool, record: f.record, store, receive: events => received.push(...events), closing: () => false });
-    expect(received).toContainEqual(legacy); expect(received).toContainEqual(captured); expect(readdirSync(spool)).toEqual([]);
+    expect(received).toContainEqual(legacy); expect(received).toContainEqual(captured); expect(spoolEntries(spool)).toEqual([]);
     expect(parseSpoolEvent({ version: 3, event: captured })).toBeNull();
+  });
+});
+
+describe('the manual setup view can never disagree with the bridge about overlap (WS2-02)', () => {
+  it('shows no overlap for Claude+Codex, Cursor+Copilot CLI or Cursor+Codex, and shows one for Claude+Cursor and Claude+Copilot CLI', async () => {
+    const pairs: { target: RegisteredObservation['connection']['provider']; other: RegisteredObservation['connection']['provider']; overlap: boolean }[] = [
+      { target: 'claude', other: 'codex', overlap: false },
+      { target: 'cursor', other: 'copilot-cli', overlap: false },
+      { target: 'cursor', other: 'codex', overlap: false },
+      { target: 'claude', other: 'cursor', overlap: true },
+      { target: 'claude', other: 'copilot-cli', overlap: true },
+    ];
+    for (const { target, other, overlap } of pairs) {
+      const targetFixture = fixture(target);
+      const otherRecord: RegisteredObservation = { ...targetFixture.record, connection: { ...targetFixture.record.connection, id: randomUUID(), provider: other } };
+      writeConfiguration(observationSetup(otherRecord, targetFixture.directory).configPath, JSON.parse(observationSetup(otherRecord, targetFixture.directory).config));
+      const setup = await inspectObservationSetup(targetFixture.record, targetFixture.directory);
+      expect(setup.readiness?.overlappingHooks, `${target} with ${other}`).toBe(overlap);
+      expect(setup.diagnostics?.some(item => item.code === 'HOOK_OVERLAP'), `${target} with ${other} diagnostics`).toBe(overlap);
+    }
+  });
+
+  it('agrees with hasAmbiguousHookOverlap for every ordered tool pair, never the wider connection-id scan the bug used', async () => {
+    const providers = surfaceSchema.options.filter((provider): provider is Exclude<ToolSurface, 'custom'> => provider !== 'custom');
+    for (const target of providers) for (const other of providers) {
+      if (target === other) continue;
+      const targetFixture = fixture(target);
+      const otherRecord: RegisteredObservation = { ...targetFixture.record, connection: { ...targetFixture.record.connection, id: randomUUID(), provider: other } };
+      writeConfiguration(observationSetup(otherRecord, targetFixture.directory).configPath, JSON.parse(observationSetup(otherRecord, targetFixture.directory).config));
+      const setup = await inspectObservationSetup(targetFixture.record, targetFixture.directory);
+      const expected = hasAmbiguousHookOverlap({ version: 2, connectionId: targetFixture.record.connection.id, provider: target, repoPath: targetFixture.root, spoolPath: spoolPath(targetFixture.directory, targetFixture.record.connection.id) });
+      expect(setup.readiness?.overlappingHooks, `${target} with ${other}`).toBe(expected);
+      // Cross-checked against the same table hookOverlapConflicts reads, so all three routes agree.
+      const predicted = hookOverlapConflicts([target, other]).some(conflict => conflict.provider === target);
+      expect(expected, `${target} with ${other}`).toBe(predicted);
+    }
+  });
+});
+
+describe('Windows file-lock handling for tracking-file writes (WS3-25)', () => {
+  it.each([false, true])('retries a locked rename then returns 409 HOOK_FILE_LOCKED, leaving no temp file or state change (remove=%s)', async remove => {
+    const f = fixture('codex');
+    await changeHooks(f.record, f.directory, f.vault); // seed a real, already-applied hook file
+    const path = observationSetup(f.record, f.directory).configPath, parent = resolve(path, '..');
+    const before = readFileSync(path, 'utf8');
+    __setRenameForTests(async () => { throw Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' }); });
+    await expect(changeHooks(f.record, f.directory, f.vault, remove)).rejects.toMatchObject({ code: 'HOOK_FILE_LOCKED', statusCode: 409 });
+    expect(readFileSync(path, 'utf8')).toBe(before);
+    expect(readdirSync(parent).some(name => name.startsWith('.agent-town-') && name.endsWith('.tmp'))).toBe(false);
+  }, 10000);
+
+  it('succeeds once the lock is released within the retry window, without a raw OS error ever surfacing', async () => {
+    const f = fixture('codex');
+    await changeHooks(f.record, f.directory, f.vault);
+    let attempts = 0;
+    const { rename } = await import('node:fs/promises');
+    __setRenameForTests(async (from, to) => {
+      attempts++;
+      if (attempts < 3) throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' });
+      await rename(from, to);
+    });
+    const result = await changeHooks(f.record, f.directory, f.vault, true);
+    expect(attempts).toBe(3);
+    expect(result.removed).toBe(true);
+  }, 10000);
+
+  it('a non-lock rename error is never retried or converted to HOOK_FILE_LOCKED', async () => {
+    const f = fixture('codex');
+    await changeHooks(f.record, f.directory, f.vault);
+    let attempts = 0;
+    __setRenameForTests(async () => { attempts++; throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' }); });
+    await expect(changeHooks(f.record, f.directory, f.vault)).rejects.toMatchObject({ code: 'ENOSPC' });
+    expect(attempts).toBe(1);
   });
 });

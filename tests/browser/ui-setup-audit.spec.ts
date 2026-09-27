@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import type { BrowserSession, ObservationSetup, Repository, Snapshot } from '@agent-town/contracts';
+import type { BrowserSession, ObservationSetup, Repository, Snapshot, VaultStatus } from '@agent-town/contracts';
 
 const checkedAt = '2026-09-15T12:00:00Z';
 const repository = (id: string): Repository => ({ id, name: `Project ${id}`, source: 'local', projectKind: 'folder', localPath: `C:\\synthetic-ui\\${id}`, description: 'Synthetic folder fixture', branch: '', color: '#859b87', position: [-6, -3], language: 'Unavailable', discoveryStatus: { state: 'current', checkedAt, lastVerifiedAt: checkedAt, reasons: [] } });
@@ -23,6 +23,11 @@ async function setupFixture(page: Page, repositories: Repository[] = []) {
     if (path === '/api/v1/session') return route.fulfill({ json: session });
     if (path.endsWith('/snapshot')) return route.fulfill({ json: snapshot });
     if (path === '/api/v1/workspaces/ui-setup-audit/observation/native-setup' && route.request().method() === 'GET') return route.fulfill({ json: { sources: [], tools: [] } });
+    // RepositoriesPanel mounts a VaultPanel per local project, which fetches this workspace's Project
+    // Vault status on mount whenever the panel is open with at least one local project (DR-061,
+    // 2026-09-25). This is legitimate, unrelated behaviour, not a bug this audit should catch — allowlist
+    // it with a well-formed, disabled status, same as native-setup above.
+    if (path === '/api/v1/workspaces/ui-setup-audit/vault' && route.request().method() === 'GET') return route.fulfill({ json: { enabled: false, backend: null, repositories: [] } satisfies VaultStatus });
     unexpected.push(`${route.request().method()} ${path}`);
     return route.fulfill({ status: 400, json: { message: 'No provider or mutation is permitted in this UI fixture.' } });
   });
@@ -41,18 +46,18 @@ test('a reachable loopback town ignores an offline internet hint and retries act
     return route.continue();
   });
   await page.goto('/?preview=1');
-  await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
+  await expect(page.getByText('Sample town · local service connected', { exact: true })).toBeVisible();
   const beforeHint = reads;
   await page.evaluate(() => window.dispatchEvent(new Event('offline')));
   await expect.poll(() => reads).toBeGreaterThan(beforeHint);
-  await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
+  await expect(page.getByText('Sample town · local service connected', { exact: true })).toBeVisible();
   blocked = true;
   await page.evaluate(() => window.dispatchEvent(new Event('offline')));
   await expect(page.getByText('Reconnecting · showing last saved state', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: /^(Run|Pause) demo$/ })).toBeDisabled();
   blocked = false;
   // No online event is sent. A local service recovering must be enough.
-  await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
+  await expect(page.getByText('Sample town · local service connected', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: /^(Run|Pause) demo$/ })).toBeEnabled();
   expect(await page.evaluate(() => navigator.onLine)).toBe(false);
   expect(pageErrors).toEqual([]);

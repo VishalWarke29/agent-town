@@ -5,7 +5,8 @@ import { MOUSE, OrthographicCamera, TOUCH, Vector3 } from 'three';
 import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib';
 import type { CameraAction } from './interaction';
 import { cameraWheelPose } from './camera-wheel';
-import { CAMERA_MAX_ZOOM, CAMERA_MIN_ZOOM, CAMERA_TRANSITION_SECONDS, cameraBasis, clampCameraZoom, interpolateCameraPose, overviewPose, resizeCameraPose, roomCameraPose, type CameraPoint, type CameraPose, type CameraViewport } from './camera-framing';
+import { archiveCameraPose, CAMERA_MAX_ZOOM, CAMERA_MIN_ZOOM, CAMERA_TRANSITION_SECONDS, cameraBasis, clampCameraZoom, interpolateCameraPose, overviewPose, resizeCameraPose, roomCameraPose, type CameraPoint, type CameraPose, type CameraViewport } from './camera-framing';
+import { ARCHIVE_CAMERA_RADIUS, ARCHIVE_VISUAL_ELEVATION } from './interaction';
 
 interface Props {
   action: CameraAction;
@@ -14,18 +15,23 @@ interface Props {
   onStopFollow: () => void;
   reducedMotion: boolean;
   active: boolean;
+  /** Only while the Archive's floating visualization is framed: lets a right-click/single-touch
+   * drag orbit around it (three.js OrbitControls' actual rotate action), so it can be looked at
+   * from any angle instead of only panned/zoomed at this world's one fixed isometric tilt. */
+  rotatable?: boolean;
 }
 type CameraMode = 'manual' | 'transition' | 'follow';
 interface Transition { from: CameraPose; to: CameraPose; elapsed: number }
 
 /** The sole writer of camera position, target and zoom, including OrbitControls input. */
-export function CameraRig({ action, follow, positions, onStopFollow, reducedMotion, active }: Props) {
+export function CameraRig({ action, follow, positions, onStopFollow, reducedMotion, active, rotatable = false }: Props) {
   const controls = useRef<OrbitControlsImpl>(null);
   const { camera, size, gl } = useThree();
   const mode = useRef<CameraMode>('manual');
   const transition = useRef<Transition | null>(null);
   const returnView = useRef<{ pose: CameraPose; viewport: CameraViewport } | null>(null);
   const framedRoom = useRef<[number, number] | null>(null);
+  const framedArchive = useRef<{ point: [number, number]; radius: number } | null>(null);
   const followed = useRef<string | null>(null);
   const viewport = useRef<CameraViewport>({ width: size.width, height: size.height });
   const initialized = useRef(false);
@@ -79,6 +85,7 @@ export function CameraRig({ action, follow, positions, onStopFollow, reducedMoti
   const stopAutomatic = useCallback(() => {
     transition.current = null;
     framedRoom.current = null;
+    framedArchive.current = null;
     followed.current = null;
     mode.current = 'manual';
     onStopFollow();
@@ -112,7 +119,9 @@ export function CameraRig({ action, follow, positions, onStopFollow, reducedMoti
     if (!initialized.current) { initialized.current = true; apply(overviewPose(next)); }
     else if (viewport.current.width !== next.width || viewport.current.height !== next.height) {
       // Resize settles a destination once. Overlay-only layout does not affect canvas size.
-      const pose = framedRoom.current ? roomCameraPose(framedRoom.current, next) : resizeCameraPose(transition.current?.to ?? readPose(), viewport.current, next);
+      const pose = framedRoom.current ? roomCameraPose(framedRoom.current, next)
+        : framedArchive.current ? archiveCameraPose(framedArchive.current.point, ARCHIVE_VISUAL_ELEVATION, framedArchive.current.radius, next)
+        : resizeCameraPose(transition.current?.to ?? readPose(), viewport.current, next);
       transition.current = null;
       if (mode.current === 'transition') mode.current = 'manual';
       apply(pose);
@@ -137,19 +146,26 @@ export function CameraRig({ action, follow, positions, onStopFollow, reducedMoti
     if (action.kind === 'room' && action.point?.every(Number.isFinite)) {
       returnView.current ??= { pose: previous, viewport: { ...viewport.current } };
       const alreadyFramed = framedRoom.current?.[0] === action.point[0] && framedRoom.current[1] === action.point[1];
-      framedRoom.current = [...action.point];
+      framedRoom.current = [...action.point]; framedArchive.current = null;
       if (alreadyFramed) apply(roomCameraPose(action.point, viewport.current));
       else begin(roomCameraPose(action.point, viewport.current));
+    } else if (action.kind === 'archive' && action.point?.every(Number.isFinite)) {
+      returnView.current ??= { pose: previous, viewport: { ...viewport.current } };
+      const radius = Number.isFinite(action.radius) ? action.radius! : ARCHIVE_CAMERA_RADIUS;
+      const alreadyFramed = framedArchive.current?.point[0] === action.point[0] && framedArchive.current?.point[1] === action.point[1] && framedArchive.current?.radius === radius;
+      framedArchive.current = { point: [...action.point], radius }; framedRoom.current = null;
+      const pose = archiveCameraPose(action.point, ARCHIVE_VISUAL_ELEVATION, radius, viewport.current);
+      if (alreadyFramed) apply(pose); else begin(pose);
     } else if (action.kind === 'return') {
       const saved = returnView.current;
-      returnView.current = null; framedRoom.current = null;
+      returnView.current = null; framedRoom.current = null; framedArchive.current = null;
       begin(saved ? resizeCameraPose(saved.pose, saved.viewport, viewport.current) : overviewPose(viewport.current));
     } else if (action.kind === 'reset') {
-      returnView.current = null; framedRoom.current = null;
+      returnView.current = null; framedRoom.current = null; framedArchive.current = null;
       // Workspace switches also request Reset: discard the previous private pose immediately.
       apply(overviewPose(viewport.current));
     } else {
-      framedRoom.current = null;
+      framedRoom.current = null; framedArchive.current = null;
       if (action.kind === 'in' || action.kind === 'out') apply({ ...previous, zoom: previous.zoom * (action.kind === 'in' ? 1.2 : 1 / 1.2) });
       if (action.kind === 'focus' && action.point?.every(Number.isFinite)) {
         const target: CameraPoint = [action.point[0], 0, action.point[1]];
@@ -188,6 +204,7 @@ export function CameraRig({ action, follow, positions, onStopFollow, reducedMoti
     }
   });
 
-  return <OrbitControls ref={controls} enabled={active} enableRotate={false} enableDamping={false} minZoom={CAMERA_MIN_ZOOM} maxZoom={CAMERA_MAX_ZOOM}
-    mouseButtons={{ LEFT: MOUSE.PAN, MIDDLE: MOUSE.DOLLY, RIGHT: MOUSE.PAN }} touches={{ ONE: TOUCH.PAN, TWO: TOUCH.DOLLY_PAN }} onStart={stopAutomatic} onChange={publish} />;
+  return <OrbitControls ref={controls} enabled={active} enableRotate={rotatable} enableDamping={false} minZoom={CAMERA_MIN_ZOOM} maxZoom={CAMERA_MAX_ZOOM}
+    mouseButtons={{ LEFT: MOUSE.PAN, MIDDLE: MOUSE.DOLLY, RIGHT: rotatable ? MOUSE.ROTATE : MOUSE.PAN }}
+    touches={{ ONE: rotatable ? TOUCH.ROTATE : TOUCH.PAN, TWO: TOUCH.DOLLY_PAN }} onStart={stopAutomatic} onChange={publish} />;
 }

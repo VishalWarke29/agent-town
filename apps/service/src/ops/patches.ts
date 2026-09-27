@@ -13,16 +13,26 @@ export function createStatePatch(before: unknown, after: unknown): StatePatch[] 
   const visit = (old: JsonValue, value: JsonValue, path: Path): void => {
     if (old === value) return;
     if (Array.isArray(old) && Array.isArray(value)) {
+      // `offset` items were dropped from the front (shift); `prepended` items were added there (unshift).
+      // Either way the surviving run is matched by key, so it costs one splice instead of an index-by-index rewrite.
       let offset = 0;
-      if (old.length && value.length && key(old[0]) !== key(value[0]) && key(value[0]) !== null) {
-        const possible = old.findIndex(item => key(item) === key(value[0]));
-        if (possible > 0 && old.slice(possible, possible + value.length).every((item, index) => key(item) !== null && key(item) === key(value[index]))) offset = possible;
+      let prepended = 0;
+      if (old.length && value.length && key(old[0]) !== key(value[0])) {
+        if (key(value[0]) !== null) {
+          const possible = old.findIndex(item => key(item) === key(value[0]));
+          if (possible > 0 && old.slice(possible, possible + value.length).every((item, index) => key(item) !== null && key(item) === key(value[index]))) offset = possible;
+        }
+        if (!offset && key(old[0]) !== null) {
+          const possible = value.findIndex(item => key(item) === key(old[0]));
+          if (possible > 0 && value.slice(possible, possible + old.length).every((item, index) => key(old[index]) !== null && key(item) === key(old[index]))) prepended = possible;
+        }
       }
       if (offset) patches.push({ op: 'splice', path, start: 0, remove: offset, values: [] });
-      const overlap = Math.min(old.length - offset, value.length);
-      for (let index = 0; index < overlap; index++) visit(old[index + offset], value[index], [...path, index]);
-      if (old.length - offset !== value.length) patches.push({ op: 'splice', path, start: overlap,
-        remove: Math.max(0, old.length - offset - overlap), values: value.slice(overlap) });
+      if (prepended) patches.push({ op: 'splice', path, start: 0, remove: 0, values: value.slice(0, prepended) });
+      const overlap = Math.min(old.length - offset, value.length - prepended);
+      for (let index = 0; index < overlap; index++) visit(old[index + offset], value[index + prepended], [...path, index + prepended]);
+      if (old.length - offset !== value.length - prepended) patches.push({ op: 'splice', path, start: prepended + overlap,
+        remove: Math.max(0, old.length - offset - overlap), values: value.slice(prepended + overlap) });
     } else if (old && value && typeof old === 'object' && typeof value === 'object' && !Array.isArray(old) && !Array.isArray(value)) {
       for (const name of new Set([...Object.keys(old), ...Object.keys(value)])) {
         if (forbidden.has(name)) throw new Error('Unsupported state property.');

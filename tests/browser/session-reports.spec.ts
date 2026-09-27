@@ -153,6 +153,13 @@ test('hidden native inventory sessions expose saved reports without adding a cha
     return route.fulfill({ status: 404, json: { message: 'Unsupported read-only inventory fixture operation.' } });
   });
   await page.getByRole('navigation', { name: 'List view navigation' }).getByRole('button', { name: 'Open connections', exact: true }).click();
+  // H0-09: opening Connections generically does not preselect a tool or open the form;
+  // the "Set up tracking" button must be clicked, then the tool and repository chosen,
+  // before NativeTrackingPanel can resolve a matching source to select. Scoped to the
+  // drawer: the List view behind it has its own same-named "Set up tracking" button.
+  await page.getByTestId('left-drawer').getByRole('button', { name: 'Set up tracking', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Agent tool', exact: true }).selectOption('codex');
+  await page.getByRole('combobox', { name: 'Repository for observation', exact: true }).selectOption('project');
   await page.getByRole('combobox', { name: 'Local agent profile', exact: true }).selectOption(sourceId);
   const card = page.locator('.native-session-card');
   await expect(card).toHaveCount(1);

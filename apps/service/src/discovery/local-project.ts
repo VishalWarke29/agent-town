@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { lstat } from 'node:fs/promises';
 import { basename, isAbsolute, join } from 'node:path';
-import { checkedPath, isWithin, pathKey } from './paths';
+import { assertSafeProjectRoot, checkedPath, isWithin, pathKey } from './paths';
 import { DiscoveryError } from './types';
 
 /** Shared with Git discovery so initializing Git later cannot create a second house. */
@@ -20,6 +20,9 @@ export async function inspectLocalProject(input: string, roots: readonly string[
   if (!isAbsolute(input)) throw new DiscoveryError('invalid-root');
   try {
     const canonicalPath = await checkedPath(input, roots);
+    // Defense in depth: roots are already checked when added, but a directly-named project folder
+    // gets its own check too, per WS1-27 ("one safe-root check for every folder the user gives Agent Town").
+    assertSafeProjectRoot(canonicalPath);
     if (!(await lstat(canonicalPath)).isDirectory()) throw new DiscoveryError('unavailable-root');
     let projectKind: 'folder' | 'git' = 'folder';
     try { await lstat(join(canonicalPath, '.git')); projectKind = 'git'; }

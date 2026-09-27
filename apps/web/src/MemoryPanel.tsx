@@ -17,7 +17,7 @@ export function ManagerQueue({ state, identity }: { state: TownState; identity: 
     const timer = setInterval(refresh, 30000);
     return () => { stopped = true; clearInterval(timer); };
   }, [identity.read, state.workspace.id, revision]);
-  return <div className="note"><div><strong>Why reports are waiting</strong><p role="status">{error ? 'Queue status is unavailable. Saved reports remain separate from processing; dispatch still checks all limits.' : status?.message ?? 'Checking saved queue conditions…'}</p>{status?.retryAt && <p className="muted small">Next automatic window: {new Date(status.retryAt).toLocaleString()}</p>}<small>These checks use no model inference.</small></div></div>;
+  return <div className="note"><div><strong>Why reports are waiting</strong><p role="status">{error ? 'Queue status is unavailable. Saved reports remain separate from processing; dispatch still checks all limits.' : status?.message ?? 'Checking saved queue conditions…'}</p>{!error && status?.state === 'waiting' && (status.retryAt ? <p className="muted small">Next automatic window: {new Date(status.retryAt).toLocaleString()}</p> : <p className="muted small">Waiting for a change. Press Process to retry.</p>)}<small>These checks use no model inference.</small></div></div>;
 }
 
 export function ReportEvidence({ report }: { report: Handoff }) {
@@ -118,11 +118,14 @@ export function MemoryPanel({ state, identity, available }: { state: TownState; 
 
 function ManualHandoff({ version, state }: { version: ContextVersion; state: TownState }) {
   const [repoId, setRepoId] = useState(''), [notice, setNotice] = useState<string | null>(null);
+  const [includeWorkspaceMaterial, setIncludeWorkspaceMaterial] = useState(false);
   const missingScope = !!repoId && !state.repositories.some(repo => repo.id === repoId);
-  const result = manualContext(version, repoId || null);
+  const result = manualContext(version, repoId || null, { includeWorkspaceMaterial });
   return <details className="workflow-details"><summary>Manual handoff of v{version.version}</summary>
     <p className="muted small">Review this saved context before pasting it into the intended agent conversation. This uses no model call and does not mark any agent as updated. The receiving tool may charge for processing it.</p>
-    <label>Handoff scope<select value={repoId} onChange={event => { setRepoId(event.target.value); setNotice(null); }}><option value="">Whole workspace</option>{missingScope && <option value={repoId}>Repository {repoId} · saved scope, no longer connected</option>}{state.repositories.map(repo => <option key={repo.id} value={repo.id}>{repo.name}</option>)}</select></label>
+    <label>Handoff scope<select value={repoId} onChange={event => { setRepoId(event.target.value); setNotice(null); setIncludeWorkspaceMaterial(false); }}><option value="">Whole workspace</option>{missingScope && <option value={repoId}>Repository {repoId} · saved scope, no longer connected</option>}{state.repositories.map(repo => <option key={repo.id} value={repo.id}>{repo.name}</option>)}</select></label>
+    {repoId && <label><input type="checkbox" className="checkbox" checked={includeWorkspaceMaterial} onChange={event => setIncludeWorkspaceMaterial(event.target.checked)} /> Also include the workspace-wide overview and unscoped legacy blockers</label>}
+    <p className="muted small">{result.scopeNote}</p>
     {result.reason ? <p className="form-notice" role="status">{result.reason}</p> : <><label>Review manual context<textarea className="saved-context" value={result.text ?? ''} readOnly rows={8} /></label><p className="muted small">{new TextEncoder().encode(result.text!).byteLength.toLocaleString()} bytes · source report references included; report bodies are not repeated.</p><button type="button" className="button" onClick={async () => {
       try { await navigator.clipboard.writeText(result.text!); setNotice('Copied for manual review and paste. Recipient delivery remains unverified.'); }
       catch { setNotice('Clipboard access is unavailable. Select and copy the preview text manually. Recipient delivery remains unverified.'); }

@@ -52,6 +52,13 @@ try {
 let SQLite;
 try { SQLite = require('better-sqlite3'); const memory = new SQLite(':memory:'); memory.prepare('SELECT 1').get(); memory.close(); add('SQLite runtime', 'ok', 'The native SQLite module loads.'); }
 catch { add('SQLite runtime', 'error', 'The native SQLite module could not load. Run npm exec --yes --package=npm@12.0.2 -- npm ci using the required Node version.'); }
+// Checked directly on disk (WS2-03), independent of whether the service is running: a hook written
+// against a missing helper would look like it worked and then never deliver a single event.
+try {
+  const bridgePath = join(project, 'apps/service/dist/hook-bridge.cjs');
+  add('Hook bridge helper', existsSync(bridgePath) && statSync(bridgePath).isFile() ? 'ok' : 'attention',
+    existsSync(bridgePath) ? 'The local tracking helper is built.' : 'The local tracking helper is not built yet. It is only needed for Watch sessions (optional); run npm run build or npm start when you turn that on.');
+} catch { add('Hook bridge helper', 'attention', 'The local tracking helper could not be checked.'); }
 if (configuration?.mode === 'demo') add('GitHub configuration', 'disabled', 'GitHub sign-in is disabled in demo mode; configured IDs are not used.');
 else if (configuration) add('GitHub configuration', configuration.githubClientId ? 'ok' : 'attention', configuration.githubClientId ? 'A public GitHub client ID is configured. Account authentication was not requested.' : 'Add the public GitHub client ID to the local configuration to enable sign-in.');
 await Promise.all([
@@ -91,6 +98,7 @@ else {
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     const matchingMode = configuration && body.applicationMode === configuration.mode;
     add('Local service', response.ok && body.ok === true && matchingMode ? 'ok' : 'attention', response.ok && body.ok === true ? `Agent Town is responding on loopback port ${port}.${matchingMode ? ' Its application mode matches.' : ' Its mode is different or unavailable; restart the intended instance.'}` : `Port ${port} answered but did not return Agent Town health.`);
+    if (response.ok && body.ok === true) add('Hook bridge build', body.rebuiltPendingRestart ? 'attention' : 'ok', body.rebuiltPendingRestart ? 'Agent Town was rebuilt. Restart it to use the new version.' : 'The hook bridge on disk matches the running service.');
   } catch { add('Local service', 'attention', `Agent Town did not answer on loopback port ${port}. Doctor does not start or stop it.`); }
 }
 const report = { version: 1, checkedAt: new Date().toISOString(), platform: process.platform, applicationMode: configuration?.mode ?? null, paidRequests: 0, checks };

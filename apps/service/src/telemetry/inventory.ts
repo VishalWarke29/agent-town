@@ -57,7 +57,9 @@ export async function scanApiInventory(options: InventoryScanOptions): Promise<A
   const bounds = { maxFiles: 300, maxFileBytes: 256_000, maxTotalBytes: 8_000_000, maxEntries: 20_000, maxDurationMs: 20_000 };
   for (const [key, value] of Object.entries(options.limits ?? {})) {
     const name = key as keyof typeof bounds;
-    if (!Number.isInteger(value) || value < 1 || !(name in bounds) || value > bounds[name]) throw new ApiInventoryError('invalid-limits');
+    // REV-22: Object.hasOwn instead of `in`, so an inherited name (constructor, toString, ...) can
+    // never be mistaken for a real bound, even though `options.limits` is internal-only today.
+    if (!Number.isInteger(value) || value < 1 || !Object.hasOwn(bounds, name) || value > bounds[name]) throw new ApiInventoryError('invalid-limits');
     bounds[name] = value;
   }
   const inventory: ApiInventory = { repoId: options.repoId, endpoints: [], scannedAt: new Date().toISOString(), filesScanned: 0, coverage: 'complete', issues: [] };

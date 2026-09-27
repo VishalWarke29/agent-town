@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
-import { nativeVisibilitySchema, registerNativeSourceSchema, scanNativeSourceSchema, surfaceSchema, type NativeSetupSnapshot, type NativeToolStatus } from '@agent-town/contracts';
+import { hideAllNativeSessionsSchema, nativeVisibilitySchema, registerNativeSourceSchema, scanNativeSourceSchema, surfaceSchema, type NativeHideAllCounts, type NativeHideAllResult, type NativeSetupSnapshot, type NativeToolStatus } from '@agent-town/contracts';
 import type { Store } from '../store.js';
 import { IdentityError } from '../identity/types.js';
 import { canonicalizeRoot, checkedPath } from '../discovery/paths.js';
@@ -25,7 +25,7 @@ function codexVersion(homePath: string): string | null {
   } catch { return null; }
 }
 
-function detectedTools(): NativeToolStatus[] {
+export function detectedTools(): NativeToolStatus[] {
   const defaults = { codex: process.env.CODEX_HOME ?? join(homedir(), '.codex'), claude: process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), cursor: process.env.CURSOR_CONFIG_DIR ?? join(homedir(), '.cursor'), 'copilot-cli': process.env.COPILOT_HOME ?? join(homedir(), '.copilot'), 'copilot-vscode': process.env.APPDATA ? join(process.env.APPDATA, 'Code', 'User') : join(homedir(), '.config', 'Code', 'User'), custom: null };
   const labels = { codex: 'Codex desktop, CLI and editor', claude: 'Claude Code', cursor: 'Cursor local SDK store', 'copilot-cli': 'Copilot CLI', 'copilot-vscode': 'Copilot in VS Code', custom: 'Other local tool' };
   return surfaceSchema.options.map(provider => {
@@ -110,7 +110,9 @@ export function registerNativeApi(app: FastifyInstance, scoped: (request: Fastif
   });
   app.get(`${prefix}/native-sessions`, async request => {
     const { store } = scoped(request), query = request.query as Record<string, string | undefined>;
-    return store.native.page(store.snapshot().state, { repoId: query.repoId, sourceId: query.sourceId, cursor: query.cursor, includeOlder: query.includeOlder === 'true' });
+    // H0-15: visibility=hidden is the only filter value the Residents "N sessions hidden · Show" list uses;
+    // anything else falls through to the unfiltered page, matching every request today.
+    return store.native.page(store.snapshot().state, { repoId: query.repoId, sourceId: query.sourceId, cursor: query.cursor, includeOlder: query.includeOlder === 'true', ...(query.visibility === 'hidden' ? { visibility: 'hidden' as const } : {}) });
   });
   app.get(`${prefix}/native-sessions/:sessionId/detail`, async request => {
     const { store } = scoped(request); return store.native.detail((request.params as { sessionId: string }).sessionId, store.snapshot().state);
@@ -118,7 +120,25 @@ export function registerNativeApi(app: FastifyInstance, scoped: (request: Fastif
   app.post(`${prefix}/native-sessions/:sessionId/visibility`, async request => {
     const { store } = scoped(request), parsed = nativeVisibilitySchema.safeParse(request.body);
     if (!parsed.success) throw new IdentityError('INVALID_NATIVE_VISIBILITY', 'Choose whether to show this session.');
-    return store.commit(`native-visibility:${randomUUID()}`, state => { store.native.visibility((request.params as { sessionId: string }).sessionId, parsed.data.visible, state); return 'observation.native_visibility'; }).snapshot;
+    // H0-15: 'refuse' is the real user-facing entry point, so a session hitting the 200-resident limit stays
+    // 'hidden' (still findable, still reversible) instead of the silent "marked shown, never placed" it left
+    // every other caller of native.visibility (test fixtures included) exactly as it was.
+    return store.commit(`native-visibility:${randomUUID()}`, state => { store.native.visibility((request.params as { sessionId: string }).sessionId, parsed.data.visible, state, { onLimit: 'refuse' }); return 'observation.native_visibility'; }).snapshot;
+  });
+  // H0-12: hide every watched session of one project in ONE commit (all or nothing). The commit type must stay "observation.*" and
+  // must not contain report, run, task, connection and the like: store.ts pins such receipts against the protected-history limit.
+  // There is deliberately no bulk "show all"; undo is per session (the visibility route above).
+  app.post(`${prefix}/native-sessions/hide-all`, async request => {
+    const { store } = scoped(request), parsed = hideAllNativeSessionsSchema.safeParse(request.body);
+    if (!parsed.success) throw new IdentityError('INVALID_NATIVE_HIDE_ALL', 'Choose a connected project.');
+    const { repoId } = parsed.data;
+    // Nothing to hide (a repeat click): answer without a commit, so no new saved event or audit note appears. No await sits between
+    // this check and the commit below, so nothing can change in between.
+    const preview = store.native.previewHideProject(repoId, store.snapshot().state);
+    if (!preview.hidden) return { repoId, ...preview, snapshot: store.snapshot() } satisfies NativeHideAllResult;
+    let counts!: NativeHideAllCounts;
+    const { snapshot } = store.commit(`native-hide-all:${randomUUID()}`, (state, now) => { counts = store.native.hideProject(repoId, state, now); return 'observation.native_visibility_bulk'; });
+    return { repoId, ...counts, snapshot } satisfies NativeHideAllResult;
   });
   return { close() { for (const scan of scans.values()) scan.abort(); scans.clear(); } };
 }

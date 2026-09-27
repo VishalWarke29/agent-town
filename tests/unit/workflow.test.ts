@@ -33,7 +33,7 @@ function setup() {
   const enable = async () => {
     await service.connectApi({ provider: 'openai', label: 'First account', apiKey: key }, 'connection-first');
     service.configurePolicy({ paidEnabled: true, dailyBudgetMicroUsd: 1_000_000, managerDailyBudgetMicroUsd: 500_000, maxRunBudgetMicroUsd: 100_000, workerConcurrency: 1, timeZone: 'UTC' }, 'policy');
-    const config: ManagerConfig = { enabled: true, connectionId: service.state().connections[0].id, model, maxInputTokens: 4000, maxOutputTokens: 800, requestBudgetMicroUsd: 100_000 };
+    const config: ManagerConfig = { enabled: true, connectionId: service.state().connections[0].id, model, maxInputTokens: 4000, maxOutputTokens: 800, requestBudgetMicroUsd: 100_000, automatic: true };
     service.configureManager(config, 'manager-config');
     return config;
   };

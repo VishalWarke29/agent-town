@@ -62,6 +62,10 @@ function powershell(scriptText: string, input: string): Promise<string> {
   });
 }
 
+/** The largest value the vault will protect, in UTF-8 bytes. The one rule for this limit: put() enforces it, and the
+ * hook installer asks it before it starts (a hook file it cannot back up is never edited, H0-10). */
+export const MAX_PROTECTED_VALUE_BYTES = 16000;
+
 /** DPAPI CurrentUser encrypted files are outside the application backup tree. */
 export class WindowsDpapiVault implements CredentialVault {
   readonly available = process.platform === 'win32';
@@ -90,7 +94,7 @@ export class WindowsDpapiVault implements CredentialVault {
 
   async put(reference: string, secret: string): Promise<void> {
     const path = this.path(reference);
-    if (!secret || Buffer.byteLength(secret) > 16000) throw new IdentityError('credential_invalid', 'Invalid protected credential value.');
+    if (!secret || Buffer.byteLength(secret) > MAX_PROTECTED_VALUE_BYTES) throw new IdentityError('credential_invalid', 'Invalid protected credential value.');
     await this.initialize();
     const encrypted = await powershell(script, JSON.stringify({ operation: 'protect', value: Buffer.from(secret, 'utf8').toString('base64') }));
     if (!/^[A-Za-z0-9+/]+=*$/.test(encrypted)) throw new IdentityError('vault_unavailable', 'Protected credential storage returned invalid data.', 503);

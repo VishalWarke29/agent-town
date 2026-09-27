@@ -77,13 +77,24 @@ export const DEFAULT_DISCOVERY_LIMITS: Readonly<DiscoveryLimits> = Object.freeze
   gitTimeoutMs: 3_000, maxGitOutputBytes: 512_000, maxMetadataFileBytes: 128_000,
 });
 
+export type ProtectedRootCode =
+  | 'system-root' | 'program-files-root' | 'user-profile-root' | 'other-profile-root'
+  | 'app-data-root' | 'agent-town-data-root' | 'excluded-name-root';
+
 export class DiscoveryError extends Error {
-  constructor(public readonly code: 'invalid-root' | 'unsafe-root' | 'unavailable-root' | 'invalid-limits') {
+  constructor(public readonly code: 'invalid-root' | 'unsafe-root' | 'unavailable-root' | 'invalid-limits' | ProtectedRootCode) {
     super({
       'invalid-root': 'Choose an absolute local project folder, not a drive or home folder.',
       'unsafe-root': 'The selected folder contains a symbolic link, junction, or unsupported path.',
       'unavailable-root': 'The selected folder is unavailable or is not a directory.',
       'invalid-limits': 'Discovery limits must be positive integers within the supported bounds.',
+      'system-root': 'Windows system folders cannot be used as a project folder.',
+      'program-files-root': 'Installed-application folders cannot be used as a project folder.',
+      'user-profile-root': 'The Users folder itself cannot be used as a project folder. Choose a folder inside your own account.',
+      'other-profile-root': 'Another account’s profile folder cannot be used as a project folder. Choose a folder inside your own account.',
+      'app-data-root': 'Application-data folders (AppData) cannot be used as a project folder.',
+      'agent-town-data-root': 'Agent Town’s own private data folder cannot be used as a project folder.',
+      'excluded-name-root': 'This folder’s name is reserved for build, dependency or tool output and cannot be used as a project folder.',
     }[code]);
     this.name = 'DiscoveryError';
   }

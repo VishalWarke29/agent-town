@@ -16,8 +16,15 @@ test('a plain allowed folder becomes a persistent local project without initiali
   mkdirSync(projectPath);
   writeFileSync(sourcePath, originalSource);
   let now = Date.now(), modelCalls = 0, githubListings = 0;
+  // Connecting a project reads no tool profile folder (D38, H0-02; tests/browser/houses-first.spec.ts pins it). They are still pointed at nothing,
+  // so that if a tool check ever came back it could not depend on the machine running this journey.
+  const profileEnv = ['CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'CURSOR_CONFIG_DIR', 'COPILOT_HOME'] as const;
+  const savedEnv = Object.fromEntries(profileEnv.map(name => [name, process.env[name]]));
+  for (const name of profileEnv) process.env[name] = join(directory, 'absent-profile');
   const errors: string[] = [], remote: string[] = [];
   const mutations: { path: string; body: unknown }[] = [];
+  // Every /api/v1 request, reads included (mutations above are only the writes), so "nothing was checked" can be asserted.
+  const requests: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
   const vaultData = new Map<string, string>();
   const vault: CredentialVault = {
@@ -84,16 +91,17 @@ test('a plain allowed folder becomes a persistent local project without initiali
       const request = route.request(), url = new URL(request.url());
       if (url.origin !== baseHeaders.origin) { remote.push(url.origin); await route.abort(); return; }
       if (!url.pathname.startsWith('/api/v1/')) { await route.continue(); return; }
+      requests.push(`${request.method()} ${url.pathname}${url.search}`);
       if (request.method() !== 'GET' && url.pathname !== '/api/v1/session') mutations.push({ path: url.pathname, body: request.postDataJSON() });
       const response = await instance.app.inject({ method: request.method() as 'GET' | 'POST' | 'PATCH', url: `${url.pathname}${url.search}`, headers: { ...request.headers(), ...baseHeaders, cookie }, ...(request.postData() ? { payload: request.postData()! } : {}) });
       await route.fulfill({ status: response.statusCode, contentType: 'application/json', body: response.body });
     });
     await page.goto('/');
     await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
-    await page.getByRole('button', { name: 'Connect repositories', exact: true }).click();
+    await page.getByRole('button', { name: 'Connect a project', exact: true }).click();
     const local = page.getByRole('region', { name: 'Local folders', exact: true });
-    await local.getByLabel('Selected parent folder', { exact: true }).fill(projectPath);
-    await local.getByRole('button', { name: 'Add selected folder', exact: true }).click();
+    await local.getByLabel('Project folder', { exact: true }).fill(projectPath);
+    await local.getByRole('button', { name: 'Add this project', exact: true }).click();
     await expect(local.getByRole('button', { name: `Use ${projectPath} as a local project`, exact: true })).toBeEnabled();
     await local.getByRole('button', { name: 'Scan selected folders', exact: true }).click();
     await expect(local.getByRole('heading', { name: 'No Git repositories found', exact: true })).toBeVisible();
@@ -108,6 +116,19 @@ test('a plain allowed folder becomes a persistent local project without initiali
     await useProject.focus();
     await expect(useProject).toBeFocused();
     await page.keyboard.press('Enter');
+    // The first connected project opens its own details. D38 (H0-02): live tracking is there but collapsed, and nothing has been checked:
+    // no tool check, no session read and no health poll (there is no connection). It used to open itself and scan this computer's tool folders.
+    // H0-07: the Watch sessions (optional) panel now renders last in the inspector, after facts, the Assign line, residents and details.
+    const firstDetails = page.getByTestId('right-drawer');
+    await expect(firstDetails).toContainText('Local project folder');
+    const tracking = firstDetails.getByRole('region', { name: /^Live tracking:/ });
+    await expect(tracking).toBeVisible();
+    await expect(tracking.getByRole('button', { name: 'Show details', exact: true })).toHaveAttribute('aria-expanded', 'false');
+    await page.waitForTimeout(1500);
+    expect(requests.filter(request => /\/observation(\/|\?|$)|\/health/.test(request)), `connecting must check nothing.\n${requests.join('\n')}`).toEqual([]);
+    await page.getByRole('button', { name: 'Close details', exact: true }).click();
+    await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
+    await page.getByRole('button', { name: 'Repositories', exact: true }).click();
     await expect(local.getByRole('button', { name: `Project connected: ${projectPath}`, exact: true })).toBeDisabled();
     const candidate = page.locator('.candidate-row').filter({ hasText: projectName });
     await expect(candidate.getByRole('checkbox')).toBeChecked();
@@ -140,13 +161,20 @@ test('a plain allowed folder becomes a persistent local project without initiali
     await page.getByRole('button', { name: 'Repository details', exact: true }).click();
     const details = page.getByTestId('right-drawer');
     await expect(details).toContainText('Local project folder');
-    await expect(details).toContainText('Not configured · observation available');
+    // H0-07: a plain folder's Git fact reads "Plain folder · no Git" (DES-02 IN-2), never the old
+    // "Not configured · observation available" wording.
+    await expect(details).toContainText('Plain folder · no Git');
     await expect(details.getByTestId('repository-agents')).toHaveAttribute('data-repo-id', repository.id);
-    await expect(details.getByRole('heading', { name: 'No observed sessions for this repository', exact: true })).toBeVisible();
+    await expect(details.getByRole('heading', { name: 'No sessions are being watched. No sessions were scanned.', exact: true })).toBeVisible();
+    // H0-07: facts, the Assign slot, Residents, Details, then Watch sessions (optional) last — on real,
+    // service-backed data, not just a fixture.
+    expect(await details.locator('[data-slot]').evaluateAll(nodes => nodes.map(node => node.getAttribute('data-slot')))).toEqual(['facts', 'assign', 'residents', 'details', 'watch']);
     expect((await new AxeBuilder({ page }).include('[data-testid="right-drawer"]').analyze()).violations).toEqual([]);
     await page.screenshot({ path: `docs/assets/previews/local-folder-${testInfo.project.name}.png` });
     expect(mutations.filter(call => call.path.endsWith('/projects/local'))).toEqual([{ path: `${prefix}/projects/local`, body: { path: projectPath } }]);
     expect(mutations.every(call => ['/roots', '/scans', '/projects/local'].some(suffix => call.path.endsWith(suffix)))).toBe(true);
+    // The whole journey (connect, reload, enter the house, open its details) made no tool check, session read, connection call or health poll.
+    expect(requests.filter(request => /\/observation(\/|\?|$)|\/health/.test(request)), `the journey must check nothing.\n${requests.join('\n')}`).toEqual([]);
     expect(readFileSync(sourcePath, 'utf8')).toBe(originalSource);
     expect(existsSync(join(projectPath, '.git'))).toBe(false);
     expect(modelCalls).toBe(0); expect(githubListings).toBe(0);
@@ -155,6 +183,7 @@ test('a plain allowed folder becomes a persistent local project without initiali
     try {
       if (!page.isClosed()) await page.close();
     } finally {
+      for (const name of profileEnv) { if (savedEnv[name] === undefined) delete process.env[name]; else process.env[name] = savedEnv[name]; }
       await instance.app.close();
       const full = resolve(directory);
       if (!full.startsWith(resolve(tmpdir()) + sep) || !full.includes('agent-town-local-folder-')) throw new Error('Unsafe fixture cleanup');

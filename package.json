@@ -23,6 +23,7 @@
     "test:coverage": "vitest run --coverage",
     "test:e2e": "node scripts/test-browser.mjs",
     "doctor": "node scripts/doctor.mjs",
+    "safety-copy": "node scripts/safety-copy.mjs",
     "ops": "node apps/service/dist/ops.js"
   },
   "devDependencies": {

@@ -43,7 +43,13 @@ async function fixture(page: Page, agents: Agent[], handoffs: Handoff[] = []) {
   await page.route('**/api/v1/**', async route => {
     const path = new URL(route.request().url()).pathname, method = route.request().method();
     if (path === '/api/v1/session') return route.fulfill({ json: browserSession });
+    // LiveTrackingPanel polls this (WS3-24) for a "rebuilt, restart to use it" notice, but only while the project has a
+    // connection, and at most every 30 seconds (H0-02, D38); a fixture with nothing to report answers it, and it is
+    // not an unsupported action. tests/browser/houses-first.spec.ts pins when it may and may not be asked.
+    if (path === '/api/v1/health' && method === 'GET') return route.fulfill({ json: { ok: true, rebuiltPendingRestart: false } });
+    // Only a mock. Nothing asks for a tool check on its own any more: it starts when the person presses "Check this computer" (H0-02, D38).
     if (path === '/api/v1/workspaces/hierarchy-fixture/snapshot' && method === 'GET') return route.fulfill({ json: snapshot });
+    if (path === '/api/v1/workspaces/hierarchy-fixture/observation/tool-detection' && method === 'GET') return route.fulfill({ json: { repoId: new URL(route.request().url()).searchParams.get('repoId'), tools: ['codex', 'claude', 'cursor', 'copilot-cli'].map(provider => ({ provider, label: provider, state: 'not-installed', sessionCount: null, sessionCountExact: true, message: null })) } });
     const reportMatch = path.match(/^\/api\/v1\/workspaces\/hierarchy-fixture\/agents\/(hierarchy-\d+)\/reports$/);
     if (reportMatch && method === 'GET') {
       reportReads.push(reportMatch[1]!);

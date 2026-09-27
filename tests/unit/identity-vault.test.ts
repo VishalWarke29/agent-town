@@ -1,9 +1,63 @@
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
-import { expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { createApp } from '../../apps/service/src/app';
-import { IdentityRegistry, IdentityService, WindowsDpapiVault, type IdentityProvider } from '../../apps/service/src/identity';
+import { createDefaultIdentity, IdentityRegistry, IdentityService, resolveVaultDirectory, WindowsDpapiVault, type IdentityProvider } from '../../apps/service/src/identity';
+
+const realCredentialsDirectory = process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'AgentTownCredentials') : undefined;
+async function realVaultFileCount(): Promise<number> {
+  if (!realCredentialsDirectory) return 0;
+  try { return (await readdir(realCredentialsDirectory)).length; } catch { return 0; }
+}
+
+const savedEnv = { AGENT_TOWN_DATA_DIR: process.env.AGENT_TOWN_DATA_DIR, AGENT_TOWN_VAULT_DIR: process.env.AGENT_TOWN_VAULT_DIR };
+beforeEach(() => { delete process.env.AGENT_TOWN_DATA_DIR; delete process.env.AGENT_TOWN_VAULT_DIR; });
+afterEach(() => {
+  for (const [key, value] of Object.entries(savedEnv)) { if (value === undefined) delete process.env[key as keyof typeof savedEnv]; else process.env[key as keyof typeof savedEnv] = value; }
+});
+
+it('resolveVaultDirectory: leaves the owner\'s real vault path unchanged when no scoping env var is set', () => {
+  expect(resolveVaultDirectory('/some/private/dir')).toBeUndefined();
+  expect(resolveVaultDirectory()).toBeUndefined();
+});
+
+it('resolveVaultDirectory: derives a scoped vault dir from the data directory when AGENT_TOWN_DATA_DIR is set', () => {
+  process.env.AGENT_TOWN_DATA_DIR = 'C:/scratch/browser-tests/123';
+  expect(resolveVaultDirectory('C:/scratch/browser-tests/123/development/private')).toBe(join('C:/scratch/browser-tests/123/development/private', 'credentials'));
+});
+
+it('resolveVaultDirectory: AGENT_TOWN_VAULT_DIR always wins, even over a scoped data directory', () => {
+  process.env.AGENT_TOWN_DATA_DIR = 'C:/scratch/browser-tests/123';
+  process.env.AGENT_TOWN_VAULT_DIR = 'C:/scratch/explicit-vault';
+  expect(resolveVaultDirectory('C:/scratch/browser-tests/123/development/private')).toBe(resolve('C:/scratch/explicit-vault'));
+});
+
+it.skipIf(process.platform !== 'win32')('createDefaultIdentity: a scoped instance (AGENT_TOWN_DATA_DIR set) stores a real credential without writing to the owner\'s real vault folder', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-town-vault-isolation-'));
+  const privateDirectory = join(directory, 'private');
+  process.env.AGENT_TOWN_DATA_DIR = directory;
+  const before = await realVaultFileCount();
+  const identity = createDefaultIdentity(privateDirectory);
+  try {
+    const vault = (identity as unknown as { vault: WindowsDpapiVault }).vault;
+    await vault.put('fake-secret-reference', 'fake-secret-value-never-a-real-token');
+    expect(await vault.get('fake-secret-reference')).toBe('fake-secret-value-never-a-real-token');
+    const scopedFiles = await readdir(join(privateDirectory, 'credentials'));
+    expect(scopedFiles).toContain('fake-secret-reference.dpapi');
+    const after = await realVaultFileCount();
+    expect(after).toBe(before);
+  } finally {
+    identity.close();
+    identityCleanupGuard(directory);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+function identityCleanupGuard(directory: string): void {
+  const target = resolve(directory);
+  if (!target.startsWith(resolve(tmpdir()) + sep) || !target.includes('agent-town-vault-isolation-')) throw new Error('Unsafe fixture cleanup');
+}
 
 it.skipIf(process.platform !== 'win32')('completes device sign-in through the real Windows vault and keeps the workspace through service restart', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-town-native-sign-in-'));

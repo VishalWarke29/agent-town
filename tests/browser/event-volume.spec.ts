@@ -152,7 +152,7 @@ test('20 saved events per second reach the activity view through real SSE', asyn
     });
     await instance.app.listen({ host: '127.0.0.1', port });
     await page.goto(`http://127.0.0.1:${port}/?preview=1`);
-    await expect(page.getByText('Demo mode · local service connected', { exact: true })).toBeVisible();
+    await expect(page.getByText('Sample town · local service connected', { exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Open saved activity', exact: true }).click();
     const clockBefore = await clockCalibration(page);
     await page.evaluate(() => { window.volumeProbe.observeFeed(); window.volumeProbe.armed = true; });

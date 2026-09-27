@@ -2,9 +2,10 @@ import { resolve } from 'node:path';
 import { createApp } from './app.js';
 import { createDefaultIdentity } from './identity/index.js';
 import { applicationDataPaths, readLocalConfig } from './config.js';
-import { acquireDataDirectoryLock, verifyDataScopeManifest } from './ops/lock.js';
+import { acquireDataDirectoryLock, OperationsError, verifyDataScopeManifest } from './ops/lock.js';
 import { buildInfo } from './build-info.js';
 import { BackupScheduler } from './ops/scheduler.js';
+import { createShutdown } from './shutdown.js';
 
 const port = Number(process.env.AGENT_TOWN_PORT ?? 4310);
 if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('AGENT_TOWN_PORT must be between 1024 and 65535.');
@@ -18,7 +19,14 @@ const { directory, database, privateDirectory } = applicationDataPaths(config.mo
 const dataScope = { mode: config.mode, customBase: process.env.AGENT_TOWN_DATA_DIR ? resolve(process.env.AGENT_TOWN_DATA_DIR) : null };
 verifyDataScopeManifest(directory, dataScope);
 verifyDataScopeManifest(privateDirectory, dataScope);
-const release = acquireDataDirectoryLock(privateDirectory, 'service');
+let release: () => void;
+try { release = acquireDataDirectoryLock(privateDirectory, 'service'); }
+catch (error) {
+  // A locked or unreadable data directory is an operator problem with instructions attached, not a crash to show a stack for.
+  if (!(error instanceof OperationsError)) throw error;
+  process.stderr.write(`${error.message}\n`);
+  process.exit(1);
+}
 process.once('exit', release);
 const identity = config.mode === 'demo' ? undefined : createDefaultIdentity(privateDirectory, config.githubClientId, () => readLocalConfig().githubClientId);
 const backups = config.mode === 'demo' ? undefined : new BackupScheduler({ sourceDirectory: privateDirectory });
@@ -30,12 +38,9 @@ const backups = config.mode === 'demo' ? undefined : new BackupScheduler({ sourc
 // process, so process.connected is a reliable, un-spoofable dev-supervisor signal.
 const development = config.mode !== 'production' && process.connected === true;
 const { app } = await createApp({ database, privateDirectory, identity, backups, port, developmentWebPort, mode: config.mode, development, logger: true });
-let stopping = false;
-for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, () => {
-  if (stopping) return;
-  stopping = true;
-  void app.close().then(() => { release(); process.exit(0); }, () => { release(); process.exit(1); });
-});
+const shutdown = createShutdown({ close: () => app.close(), release, exit: code => process.exit(code), log: message => process.stderr.write(`${message}\n`) });
+// SIGBREAK is Ctrl+Break and SIGHUP is closing the console window on Windows; without them the process is ended with the lock still held.
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP'] as const) process.on(signal, () => shutdown(signal));
 try {
   await app.listen({ host: '127.0.0.1', port });
   process.stdout.write(`Runtime: ${buildInfo.id}${buildInfo.builtAt ? ` | built ${buildInfo.builtAt}` : ' | source hot reload'}\n`);

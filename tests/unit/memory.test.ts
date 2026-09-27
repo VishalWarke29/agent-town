@@ -15,7 +15,7 @@ function setup() {
   const workflow = initialWorkflow();
   workflow.connections.push({ id: 'connection', provider: 'openai', mode: 'api', label: 'Fixture', status: 'verified', accountIdentity: 'unavailable', verifiedAt: time(), createdAt: time(), models: ['fixture'], capabilities: { manager: true, managedExecution: true } });
   workflow.policy = { ...workflow.policy, paidEnabled: true, dailyBudgetMicroUsd: 1000000, maxRunBudgetMicroUsd: 100000, managerDailyBudgetMicroUsd: 100000 };
-  workflow.manager.config = { enabled: true, connectionId: 'connection', model, maxInputTokens: 4000, maxOutputTokens: 800, requestBudgetMicroUsd: 100000 };
+  workflow.manager.config = { enabled: true, automatic: true, connectionId: 'connection', model, maxInputTokens: 4000, maxOutputTokens: 800, requestBudgetMicroUsd: 100000 };
   const state: TownState = { schemaVersion: 1, workspace: { mode: 'private', id: 'memory-workspace', name: 'Fixture' }, workflow,
     repositories: [{ id: 'repo', name: 'Fixture', branch: 'main', description: '', language: '', color: '#abc', position: [0, 0] }],
     agents: [], handoffs: [], activity: [], simulation: { running: false, step: 0 }, manager: { version: 0, brief: 'Keep the original objective.', updatedAt: null } };

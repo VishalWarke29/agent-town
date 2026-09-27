@@ -15,6 +15,7 @@ export class ObservationRegistry {
     this.db.exec('CREATE TABLE IF NOT EXISTS observation_connections (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, owner_id TEXT NOT NULL, repo_path TEXT NOT NULL, token_hash TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL)');
   }
   register(record: RegisteredObservation, token: string) {
+    if (record.connection.id !== record.connection.id.toLowerCase()) throw new IdentityError('INVALID_CONNECTION', 'Use a lower-case connection identifier.');
     // The route awaits credential protection after its early duplicate check.
     // Serialize this final check with insertion, including other registry handles.
     this.db.transaction(() => {
@@ -43,6 +44,14 @@ export class ObservationRegistry {
     return row ? this.map(row) : null;
   }
   all(): RegisteredObservation[] { return (this.db.prepare('SELECT * FROM observation_connections WHERE revoked=0').all() as Row[]).map(row => this.map(row)); }
+  /** H0-13: unlike all(), includes a revoked row — Stop watching must still find (and finish cleaning up) a
+   * connection whose earlier attempt got as far as revoke but not clean-up before it stopped. Scoped to one
+   * workspace and project, ordered by rowid, so a caller never has to filter every connection in the registry
+   * to find the handful that belong to the project it is stopping. */
+  forProject(workspaceId: string, repoId: string): RegisteredObservation[] {
+    return (this.db.prepare('SELECT *,rowid FROM observation_connections WHERE workspace_id=? ORDER BY rowid').all(workspaceId) as (Row & { rowid: number })[])
+      .map(row => this.map(row)).filter(record => record.connection.repoId === repoId);
+  }
   authenticate(bearer: string | undefined): RegisteredObservation {
     const match = /^Bearer ([a-f0-9-]{36})\.([a-f0-9]{64})$/.exec(bearer ?? '');
     if (!match) throw new IdentityError('CONNECTOR_AUTH_REQUIRED', 'A scoped observation credential is required.', 401);
@@ -52,5 +61,8 @@ export class ObservationRegistry {
     return this.map(row);
   }
   revoke(id: string) { this.db.prepare('UPDATE observation_connections SET revoked=1 WHERE id=?').run(id); }
+  /** Deletes a registration that never became active, so the same id can be registered again.
+   * Callers may only discard a row their own request just inserted; an active use is never undone here. */
+  discard(id: string) { this.db.prepare('DELETE FROM observation_connections WHERE id=? AND revoked=0').run(id); }
   close() { this.db.close(); }
 }

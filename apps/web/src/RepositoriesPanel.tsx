@@ -1,49 +1,15 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import { Check, FolderGit2, FolderPlus, Github, LoaderCircle, Search, Square } from 'lucide-react';
-import type { GitHubListingStatus, Repository, RootRemovalReview, TownState } from '@agent-town/contracts';
+import { Check, FolderGit2, FolderOpen, FolderPlus, Github, LoaderCircle, Search, Square } from 'lucide-react';
+import type { GitHubListingStatus, Repository, RootRemovalReview, TownState, VaultStatus } from '@agent-town/contracts';
 import type { IdentityController } from './useIdentity';
+import { folderWindowText, reasonText } from './reasonText';
+import { useFolderBrowse } from './useFolderBrowse';
+import { connectedProjectNotice } from './houseCopy';
+import { VaultPanel } from './VaultPanel';
 
-const explanations: Record<string, string> = {
-  'no-installations': 'No installation is available to this account. Install your configured GitHub App on the personal account or organization that owns the repositories, select repositories, then check again.',
-  'no-repositories': 'The accessible installations returned no repositories. Review the App’s repository selection and your own access. Organization owners may need to approve installation or repository access.',
-  'suspended-installation': 'An installation is suspended. Ask its account or organization owner to restore access, then check again.',
-  'installation-limit': 'Only the first 100 installations were checked. This inventory is incomplete.',
-  'page-limit': 'The GitHub page limit was reached. Some permitted repositories were not returned.',
-  'deadline': 'The shared 12-second limit was reached. The repositories already received are available below; retry to check missing results.',
-  'candidate-limit': 'The 200-record review limit was reached. Selected repositories are preserved; some new results were not retained.',
-  'github_unauthorized': 'GitHub authorization expired or was revoked. Open Connections and sign in again.',
-  'github_not_connected': 'Connect GitHub in Connections, then check repository access again.',
-  'github_access_limited': 'GitHub denied or rate-limited this check. Review App installation, organization approval and your account access, then retry later.',
-  'github_permissions_too_broad': 'The configured GitHub App has write permissions. Change its repository permissions to read-only before discovery.',
-  'github_listing_timeout': 'GitHub did not respond within the 12-second limit. Check the connection and retry.',
-  'github_listing_cancelled': 'The GitHub check was cancelled. Retry when ready.',
-  'github_unavailable': 'GitHub could not be reached. Previous records are stale; check your connection and retry.',
-  'github_response_invalid': 'GitHub returned an unexpected response. Previous records are stale; retry later.',
-  'github-repository-unavailable': 'Not returned by the latest complete GitHub check. It may have moved or access may have changed; saved history is preserved.',
-  'repository-unavailable': 'Not found by the latest complete local scan. Check that the checkout still exists inside an allowed folder.',
-  'project-folder-unavailable': 'This project folder could not be read. Check that it still exists at the saved path, then scan again.',
-  'git-metadata-not-scanned': 'This folder has Git metadata that has not been verified. Scan selected folders to check it.',
-  'entry-limit': 'The entry limit was reached. Choose a smaller parent folder to check omitted paths.',
-  'depth-limit': 'Some folders were too deeply nested. Add a closer parent folder to check them.',
-  'repository-limit': 'The 100-repository scan limit was reached. Choose smaller parent folders.',
-  'instruction-limit': 'Some instruction metadata exceeded the per-repository limit.',
-  'time-limit': 'The scan time limit was reached. Choose a smaller parent folder and retry.',
-  'unreadable-entry': 'Some selected paths could not be read. Check their existence and local permissions.',
-  'unsafe-path': 'Links or unsafe paths were skipped. Select the actual checkout folder; discovery does not follow links.',
-  'git-unavailable': 'Git metadata could not be verified. Check the Git installation and checkout access.',
-  'git-output-limit': 'Git output exceeded the safe read limit; Git measurements are unavailable.',
-  'git-timeout': 'Git did not respond in time; Git measurements are unavailable.',
-  'unsafe-git-config': 'Git settings require unsupported or executable behavior. This checkout was not executed.',
-  'unsupported-git-layout': 'The Git layout cannot be safely read by this scanner.',
-  'external-git-directory': 'A worktree’s Git directory is outside the allowed folders. Add its actual parent folder only if you intend to allow it.',
-  'cancelled': 'This scan was cancelled. Scan again to verify the saved inventory.',
-  'scan-failed': 'The scan failed. Check folder access and retry.',
-  'scan-interrupted': 'The service stopped during the scan. Scan again to verify saved inventory.',
-};
-const reasonText = (reason: string) => explanations[reason] ?? 'Some metadata could not be verified. Review the selected scope and retry.';
 const timeText = (value: string) => new Date(value).toLocaleString();
 
-export function RepositoriesPanel({ state, request, available }: { state: TownState; request: IdentityController['request']; available: boolean }) {
+export function RepositoriesPanel({ state, request, available, onConnected }: { state: TownState; request: IdentityController['request']; available: boolean; onConnected?: (repoId: string) => void }) {
   const [root, setRoot] = useState('');
   const [chosen, setChosen] = useState<string[]>(state.repositories.map(repo => repo.id));
   const [busy, setBusy] = useState(false);
@@ -54,6 +20,7 @@ export function RepositoriesPanel({ state, request, available }: { state: TownSt
   const [githubNotice, setGithubNotice] = useState<string | null>(null);
   const [githubBusy, setGithubBusy] = useState(false);
   const [removal, setRemoval] = useState<RootRemovalReview | null>(null);
+  const [vaultStatus, setVaultStatus] = useState<VaultStatus | null>(null);
   const helpId = useId();
   const pending = useRef(false);
   const mounted = useRef(true);
@@ -71,6 +38,17 @@ export function RepositoriesPanel({ state, request, available }: { state: TownSt
     setChosen(current => [...new Set([...current.filter(id => !removed.has(id)), ...added])]);
   }, [selectedKey]);
   const prefix = `/workspaces/${encodeURIComponent(state.workspace.id)}`;
+  useEffect(() => {
+    if (!state.repositories.some(repo => repo.localPath)) return;
+    let disposed = false;
+    void request<VaultStatus>(`${prefix}/vault`, undefined, undefined, 'GET').then(result => { if (!disposed && mounted.current) setVaultStatus(result); }).catch(() => {});
+    return () => { disposed = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.workspace.id]);
+  const fieldRef = useRef<HTMLInputElement>(null);
+  const browseRef = useRef<HTMLButtonElement>(null);
+  // "Browse..." only ever fills the path field with text; adding the folder stays the separate step below.
+  const folder = useFolderBrowse({ prefix, request, onPath: setRoot, fields: { field: fieldRef, browse: browseRef } });
   const discovery = state.discovery;
   const running = discovery?.operation?.status === 'running';
   const candidates = Array.from(new Map([...state.repositories, ...(discovery?.candidates ?? [])].map(repo => [repo.id, repo])).values());
@@ -81,8 +59,13 @@ export function RepositoriesPanel({ state, request, available }: { state: TownSt
   const emptyGitScan = discovery?.operation?.status === 'complete' && discovery.operation.foundCount === 0;
   const listing = discovery?.githubListing;
   const blocked = !available ? 'Reconnect to the local service before changing repository setup.' : busy ? 'Wait for the current request to finish.' : running ? 'Wait for the current scan, or cancel it below.' : null;
-  const rootHelp = blocked ?? (roots.length >= 8 ? 'Eight folders are already allowed. Keep this scope or remove an unused folder before adding another.' : !root.trim() ? 'Type or paste an absolute folder path first. The example below is not selected.' : 'Add this folder to allow read-only discovery inside it.');
-  const scanHelp = blocked ?? (!roots.length ? 'Add a parent folder above before scanning.' : 'Scan only the allowed folders listed above. This does not run project code.');
+  const rootHelp = blocked ?? (roots.length >= 8 ? 'Eight folders are already allowed. Keep this scope or remove an unused folder before adding another.' : !root.trim() ? 'Type or paste an absolute folder path first. The example below is not selected.' : 'Let Agent Town look inside this folder, read-only, for projects.');
+  const scanHelp = blocked ?? (!roots.length ? 'Add a project folder above before scanning.' : 'Scan only the allowed folders listed above. This does not run project code.');
+  // Only what would make the path useless disables it (no service, or no room for another folder), with the same visible
+  // reason as the Add button. A scan or a request in flight does not matter to choosing a folder, and a window that is
+  // already open stays usable (a second click just says so), so the button never loses focus while the person is choosing.
+  const browseUnavailable = !folder.active && (!available || roots.length >= 8);
+  const folderMessageId = `${helpId}-folder-message`;
 
   const act = async (work: () => Promise<void>, github = false) => {
     if (pending.current) return;
@@ -98,15 +81,36 @@ export function RepositoriesPanel({ state, request, available }: { state: TownSt
     <p className="muted small">Connect a local project folder directly, or discover Git repositories and save your selection. These actions use no AI credits.</p>
     <section aria-label="Local folders">
     <h4>Local folders</h4>
-    <p className="muted small">Add your project folder, then choose <strong>Use as local project</strong>. Git is optional. To find Git repositories inside a parent folder, use <strong>Scan selected folders</strong>.</p>
+    <p className="muted small">Add your project folder, then choose <strong>Use as local project</strong>. Git is optional. To find Git repositories inside a project folder, use <strong>Scan selected folders</strong>.</p>
     {error && <p className="form-error" role="alert">{error}</p>}
     {notice && <p className="form-notice" role="status">{notice}</p>}
-    <form className="setup-form" onSubmit={event => { event.preventDefault(); if (root.trim()) void act(async () => { await request(`${prefix}/roots`, { path: root.trim() }); if (mounted.current) { setRoot(''); setNotice('Folder added. Use it as a local project, or scan for Git repositories inside it.'); } }); }}>
-      <label>Selected parent folder<input value={root} onChange={event => setRoot(event.target.value)} required maxLength={1024} aria-describedby={`${helpId}-root`} spellCheck={false} autoComplete="off" /></label>
+    <form className="setup-form" onKeyDown={folder.onKeyDown} onSubmit={event => { event.preventDefault(); if (!root.trim()) return; folder.stop(); folder.clearMessage(); void act(async () => { await request(`${prefix}/roots`, { path: root.trim() }); if (mounted.current) { setRoot(''); setNotice('Folder added. Use it as a local project, or scan for Git repositories inside it.'); } }); }}>
+      <div className="folder-field-row">
+        <label>Project folder<input ref={fieldRef} value={root} onChange={event => { setRoot(event.target.value); folder.clearMessage(); }} required maxLength={1024}
+          aria-describedby={`${helpId}-root${folder.message?.tone === 'problem' ? ` ${folderMessageId}` : ''}`} spellCheck={false} autoComplete="off" /></label>
+        <button type="button" ref={browseRef} className="button folder-browse-button" aria-busy={folder.active} disabled={browseUnavailable}
+          aria-describedby={`${helpId}-browse${browseUnavailable ? ` ${helpId}-root` : ''}`} onClick={folder.browse}>
+          {folder.active ? <LoaderCircle size={16} className="spin" /> : <FolderOpen size={16} />}{folderWindowText.browse}
+        </button>
+      </div>
+      <div className="folder-browse">
+        <p className="muted folder-browse-hint" id={`${helpId}-browse`}>{folderWindowText.hint}</p>
+        {/* Always mounted so a screen reader hears each change once. Not atomic: a new sentence must not re-read the old one. */}
+        <div className="folder-browse-live" role="status" aria-live="polite" aria-atomic="false">
+          {folder.opening && <p className="folder-browse-wait">{folderWindowText.opening}</p>}
+          {folder.waiting && <p className="folder-browse-wait">{folderWindowText.waiting}</p>}
+          {folder.showTypeHint && <p className="folder-browse-wait">{folderWindowText.typeHint}</p>}
+          {folder.message && <p key={folder.message.id} id={folderMessageId} className={folder.message.tone === 'problem' ? 'form-error' : 'form-notice'}>{folder.message.text}</p>}
+        </div>
+        {(folder.waiting || folder.opening) && <div className="folder-browse-actions">
+          <button type="button" className="button" onClick={folder.cancel}>{folderWindowText.cancel}</button>
+          {folder.showTypeHint && <button type="button" className="button" onClick={folder.typeInstead}>{folderWindowText.typeInstead}</button>}
+        </div>}
+      </div>
       <p className="muted small" id={`${helpId}-root`}>{rootHelp} Example: <code>C:\projects</code></p>
-      <button className="button" aria-describedby={`${helpId}-root`} disabled={!!blocked || !root.trim() || roots.length >= 8}><FolderGit2 size={16} />Add selected folder</button>
+      <button className="button" aria-describedby={`${helpId}-root`} disabled={!!blocked || !root.trim() || roots.length >= 8}><FolderGit2 size={16} />Add this project</button>
     </form>
-    {roots.length > 0 ? <div className="selected-roots"><h4>Folders allowed for discovery · {roots.length}/8</h4>{roots.map(path => {
+    {roots.length > 0 ? <div className="selected-roots"><h4>Folders Agent Town may look in · {roots.length}/8</h4>{roots.map(path => {
       const connected = state.repositories.some(repo => repo.source === 'local' && repo.localPath === path);
       const connecting = connectingPath === path;
       return <article key={path} className="selected-root">
@@ -115,9 +119,15 @@ export function RepositoriesPanel({ state, request, available }: { state: TownSt
           aria-label={connected ? `Project connected: ${path}` : `Use ${path} as a local project`} aria-busy={connecting}
           onClick={() => void act(async () => {
             setConnectingPath(path);
+            // The first project opens its own details, where tracking is set up. Later ones stay here so
+            // several folders can be connected in a row.
+            const firstProject = state.repositories.length === 0;
             try {
               const result = await request<{ repository: Repository }>(`${prefix}/projects/local`, { path });
-              if (mounted.current) setNotice(`${result.repository.name} is connected and has a house in town. Open Connections to set up agent observation.`);
+              if (mounted.current) {
+                if (firstProject && onConnected) onConnected(result.repository.id);
+                else setNotice(connectedProjectNotice(result.repository.name));
+              }
             } finally { if (mounted.current) setConnectingPath(null); }
           })}>
           {connecting ? <LoaderCircle size={16} className="spin" /> : connected ? <Check size={16} /> : <FolderPlus size={16} />}
@@ -162,11 +172,16 @@ export function RepositoriesPanel({ state, request, available }: { state: TownSt
     </section>
     {(candidates.length > 0 || pendingIds.length > 0) && <form className="candidate-selection" onSubmit={event => { event.preventDefault(); void act(async () => { await request(`${prefix}/repositories/select`, { ids: chosen }); if (mounted.current) setNotice('Repository selection saved. Your town now reflects these projects.'); }); }}>
       <h3 className="subheading">Choose your repositories</h3>
-      <p className="muted small">{chosen.length}/100 selected. Stale results must be refreshed before they can be newly selected. To disconnect a repository, archive ended sessions and task attempts, remove hooks and revoke its connections, then clear its checkbox and save. Files and archived evidence stay saved.</p>
+      <p className="muted small">{chosen.length}/100 selected. Stale results must be refreshed before they can be newly selected. To disconnect a repository, archive ended sessions and task attempts, stop watching and revoke its connections, then clear its checkbox and save. Files and archived evidence stay saved.</p>
       {candidates.map(repo => <label className="candidate-row" key={repo.id}><input type="checkbox" checked={chosen.includes(repo.id)} disabled={!!blocked || (!chosen.includes(repo.id) && (chosen.length >= 100 || (!savedIds.has(repo.id) && !!repo.discoveryStatus && repo.discoveryStatus.state !== 'current')))} onChange={event => setChosen(current => event.target.checked ? [...current, repo.id] : current.filter(id => id !== repo.id))} /><span><strong>{repo.name}</strong><small>{repo.localPath ?? (repo.source === 'github' ? 'GitHub · remote metadata' : 'Local repository')}</small><small>{repo.projectKind === 'folder' ? 'Local folder · Git not configured' : repo.source === 'github' ? 'No local checkout linked' : repo.git?.availability === 'unavailable' ? 'Git measurements unavailable' : repo.branch || 'Branch unavailable'}</small><small>{repo.discoveryStatus ? `${repo.discoveryStatus.state} · Last check: ${timeText(repo.discoveryStatus.checkedAt)}` : 'Freshness not recorded; refresh to verify.'}</small>{repo.discoveryStatus && <small>Last successful verification: {repo.discoveryStatus.lastVerifiedAt ? timeText(repo.discoveryStatus.lastVerifiedAt) : 'Unavailable'}{repo.discoveryStatus.reasons.length ? ` · ${repo.discoveryStatus.reasons.map(reasonText).join(' ')}` : ''}</small>}</span></label>)}
       {!!pendingIds.length && <><p className="form-error" role="alert">Some unsaved selections disappeared after a refresh. Discard those missing choices and review the current results.</p><button className="button" type="button" onClick={() => setChosen(current => current.filter(id => !pendingIds.includes(id)))}>Discard missing selections</button></>}
       {unverifiedChoices && <p className="form-error" role="alert">An unsaved choice is now stale. Refresh it or clear its checkbox before saving.</p>}
       <button className="button primary" disabled={!!blocked || chosen.length > 100 || !!pendingIds.length || unverifiedChoices}><Check size={16} />Save repository selection</button>
     </form>}
+    {state.repositories.some(repo => repo.localPath) && <section aria-label="Project Vault" className="repository-vault">
+      <h3 className="subheading">Project Vault</h3>
+      <p className="muted small">Back up a connected project&rsquo;s own files &mdash; including ones a plain <code>git clone</code> would never bring back &mdash; to a local folder you choose, encrypted with your own passphrase. Local folder only today; no cloud account is connected yet.</p>
+      {state.repositories.filter(repo => repo.localPath).map(repo => <VaultPanel key={repo.id} state={state} request={request} repoId={repo.id} repoName={repo.name} sharedStatus={vaultStatus} onStatusChange={setVaultStatus} />)}
+    </section>}
   </section>;
 }

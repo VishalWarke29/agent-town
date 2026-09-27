@@ -1,14 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import { opendir, lstat, rename, unlink } from 'node:fs/promises';
+import { mkdir, opendir, lstat, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { type ObservationConnection, type ObservationEvent } from '@agent-town/contracts';
 import { IdentityError } from '../identity/index.js';
 import { checkedPath, readMetadataFile } from '../discovery/paths.js';
 import type { Store } from '../store.js';
 import type { RegisteredObservation } from './registry.js';
-import { SPOOL_EVENT_BYTES, SPOOL_DIRECTORY_LIMIT, SPOOL_BATCH_LIMIT } from './spool-limits.js';
-import { parseSpoolEvent, sourceBindingDiagnosticCodes, sourceDiagnosticCodes, type SourceDiagnostic } from './source-binding.js';
-const eventName = /^[a-f0-9-]{36}\.json$/;
+import { SPOOL_EVENT_BYTES, SPOOL_DIRECTORY_LIMIT, SPOOL_BATCH_LIMIT, SPOOL_NEWER_DIRECTORY_LIMIT, SPOOL_NEWER_BYTE_LIMIT } from './spool-limits.js';
+import { classifySpoolEvent, parseSpoolEvent, sourceBindingDiagnosticCodes, sourceDiagnosticCodes, type SourceDiagnostic } from './source-binding.js';
+// Exported so setup.ts's clean-up (H0-11) counts a connection's pending spool files the exact same way this
+// module's own drain does; service-capabilities.json and any marker file never match it.
+export const eventName = /^[a-f0-9-]{36}\.json$/;
 const lossClaim = /^coverage-gap-[a-f0-9-]{36}\.pending$/;
 const sourceClaim = new RegExp(`^source-diagnostic-(${sourceDiagnosticCodes.join('|')})-[a-f0-9-]{36}\\.pending$`);
 const sourceMessages: Record<SourceDiagnostic, string> = {
@@ -69,7 +71,17 @@ export async function drainObservationSpool(options: SpoolOptions): Promise<void
       return 'observation.coverage_gap';
     }, JSON.stringify({ name, reason, exact }));
   };
-  const remove = async (name: string) => { await checkedPath(spool, [directory]); await unlink(join(spool, name)); };
+  const remove = async (name: string, base = spool) => { await checkedPath(base, [directory]); await unlink(join(base, name)); };
+  const newerDirectory = join(spool, 'newer');
+  const setNewerCount = (count: number) => {
+    const previous = store.snapshot().state.observation?.connections.find(item => item.id === record.connection.id)?.newerEventCount ?? 0;
+    if (previous === count) return;
+    store.commit(`spool-newer-count:${record.connection.id}:${randomUUID()}`, state => {
+      const source = state.observation?.connections.find(item => item.id === record.connection.id);
+      if (source) source.newerEventCount = count;
+      return 'observation.newer_events';
+    });
+  };
   let pending: number | null = null;
   try {
     await checkedPath(spool, [directory]);
@@ -128,7 +140,26 @@ export async function drainObservationSpool(options: SpoolOptions): Promise<void
       recordLoss(claim, 'The bounded local hook spool reported overflow or unsupported input.', false);
       await remove(claim);
     }
-    const selected: { name: string; event: ObservationEvent }[] = [];
+    // newer/ is created lazily, only the moment something actually needs quarantining below — an
+    // empty spool must stay exactly empty, the same as before this guard existed.
+    const selected: { name: string; event: ObservationEvent; base: string }[] = [];
+    // Re-drain newer/ first: a file quarantined by an older service build may now parse cleanly if
+    // this service build understands its format. Read-only retry — a file that still fails to parse
+    // is left exactly where it is, never re-classified or removed here.
+    let newerNames: string[] = [];
+    try {
+      const newerEntries = await opendir(newerDirectory);
+      for await (const entry of newerEntries) if (eventName.test(entry.name)) newerNames.push(entry.name);
+    } catch (error) { if (errorCode(error) !== 'ENOENT') throw error; }
+    for (const name of newerNames.sort().slice(0, SPOOL_BATCH_LIMIT)) {
+      if (options.closing()) return;
+      let text: string;
+      try { text = await readMetadataFile(join(newerDirectory, name), [directory], SPOOL_EVENT_BYTES); }
+      catch (error) { if (errorCode(error) === 'ENOENT') continue; if (errorCode(error) !== 'unsafe-root') throw error; continue; }
+      let event: ObservationEvent | null = null;
+      try { event = parseSpoolEvent(JSON.parse(text)); } catch { /* Still not parseable; leave it in newer/ untouched. */ }
+      if (event) selected.push({ name, event, base: newerDirectory });
+    }
     // Sorting this bounded filename selection is for repeatability, not source order.
     for (const name of files.sort().slice(0, SPOOL_BATCH_LIMIT)) {
       if (options.closing()) return;
@@ -141,13 +172,30 @@ export async function drainObservationSpool(options: SpoolOptions): Promise<void
         recordLoss(name, 'A local event file exceeded its bound or failed path validation.', true);
         await remove(name); if (pending !== null) pending--; continue;
       }
-      let event: ObservationEvent | undefined;
-      try { event = parseSpoolEvent(JSON.parse(text)) ?? undefined; } catch { /* Invalid JSON is a rejected local record. */ }
-      if (!event) {
+      let parsed: unknown;
+      try { parsed = JSON.parse(text); } catch { recordLoss(name, 'A local event file did not match the supported event contract.', true); await remove(name); if (pending !== null) pending--; continue; }
+      const classification = classifySpoolEvent(parsed);
+      if (classification.status === 'ok') { selected.push({ name, event: classification.event, base: spool }); continue; }
+      if (classification.status === 'malformed') {
         recordLoss(name, 'A local event file did not match the supported event contract.', true);
         await remove(name); if (pending !== null) pending--; continue;
       }
-      selected.push({ name, event });
+      // 'newer': a well-formed envelope this service build doesn't understand yet. Quarantine it —
+      // move, never delete — unless the bounded newer/ folder is already at its cap. newer/ may not
+      // exist yet (nothing has ever needed quarantining in this spool); that reads as an empty folder.
+      let currentCount = 0, currentBytes = 0;
+      try {
+        const current = await opendir(newerDirectory);
+        for await (const entry of current) { if (eventName.test(entry.name)) { currentCount++; currentBytes += (await lstat(join(newerDirectory, entry.name))).size; } }
+      } catch (error) { if (errorCode(error) !== 'ENOENT') throw error; }
+      if (currentCount >= SPOOL_NEWER_DIRECTORY_LIMIT || currentBytes + Buffer.byteLength(text, 'utf8') > SPOOL_NEWER_BYTE_LIMIT) {
+        recordLoss(name, 'A newer-format event could not be quarantined because the newer/ folder is full.', false);
+        if (pending !== null) pending--; continue; // Left in place, per spec — never deleted, never silently dropped.
+      }
+      await mkdir(newerDirectory, { recursive: true });
+      await checkedPath(spool, [directory]); await checkedPath(newerDirectory, [directory]);
+      await rename(join(spool, name), join(newerDirectory, name));
+      if (pending !== null) pending--;
     }
     selected.sort((left, right) => orderObservedEvents(left.event, right.event) || left.name.localeCompare(right.name));
     for (const entry of selected) {
@@ -156,15 +204,21 @@ export async function drainObservationSpool(options: SpoolOptions): Promise<void
       catch (error) {
         if (error instanceof IdentityError && error.code === 'EVENT_TIME_INVALID') {
           recordLoss(entry.name, 'An event was outside the supported source-time window.', true);
-          await remove(entry.name); if (pending !== null) pending--; continue;
+          await remove(entry.name, entry.base); if (pending !== null && entry.base === spool) pending--; continue;
         }
         const message = error instanceof IdentityError && error.statusCode === 429
           ? 'Local events remain queued while this source or workspace is at its limit.'
           : 'Local events remain queued because delivery could not be committed. Retry follows automatically; review the source if this persists.';
         setDelivery('blocked', pending, message); return;
       }
-      await remove(entry.name); if (pending !== null) pending--;
+      await remove(entry.name, entry.base); if (pending !== null && entry.base === spool) pending--;
     }
+    try {
+      const remaining = await opendir(newerDirectory);
+      let count = 0;
+      for await (const entry of remaining) if (eventName.test(entry.name)) count++;
+      setNewerCount(count);
+    } catch (error) { if (errorCode(error) !== 'ENOENT') throw error; }
     if (temporary) { setDelivery('blocked', null, 'A hook event is still in its temporary write stage. Completed events were replayed; unfinished files are retained. If this persists after the tool exits, inspect local storage before cleanup.'); return; }
     const idle = pending === 0 && claims.length <= SPOOL_BATCH_LIMIT && sourceClaims.length <= SPOOL_BATCH_LIMIT;
     setDelivery(idle ? 'idle' : 'pending', pending, idle ? null : 'Local events or coverage notices remain queued for the next bounded replay batch.');
@@ -172,4 +226,86 @@ export async function drainObservationSpool(options: SpoolOptions): Promise<void
     // A storage error can also prevent saving diagnostics. Keep every unacknowledged file.
     try { setDelivery('blocked', pending, 'The local event spool could not be read or committed safely. Pending events are retained for retry.'); } catch { /* Durable state remains the last successful observation. */ }
   }
+}
+
+/** One mutex shared by the periodic background replay (service.ts's 500 ms timer) and every connection's
+ * bounded final drain (H0-11, orchestrated by Stop watching / H0-13): the two paths must never scan and
+ * mutate the same spool folder at once. The periodic loop only ever tries once per tick and skips that tick
+ * when the mutex is busy (tryAcquire, unchanged behaviour from before this mutex existed); a final drain
+ * waits its turn (acquire) and holds the mutex only for its own bounded work on ONE connection, releasing it
+ * the instant that connection's drain ends — Stop watching loops connections one at a time and must never
+ * keep the periodic loop shut out for the whole job. */
+export class DrainMutex {
+  private busy = false;
+  private waiters: (() => void)[] = [];
+  /** Non-blocking: returns a release function immediately, or null when the mutex is already held. */
+  tryAcquire(): (() => void) | null {
+    if (this.busy) return null;
+    this.busy = true;
+    return () => this.release();
+  }
+  /** Waits its turn (first in, first out) and resolves with a release function once held. */
+  acquire(): Promise<() => void> {
+    if (!this.busy) { this.busy = true; return Promise.resolve(() => this.release()); }
+    return new Promise(resolve => { this.waiters.push(() => resolve(() => this.release())); });
+  }
+  private release(): void {
+    const next = this.waiters.shift();
+    if (next) next(); else this.busy = false;
+  }
+}
+/** The one instance every drain path (periodic and final) shares. */
+export const drainMutex = new DrainMutex();
+
+/** About how long a final drain may run before Stop watching gives up waiting and reports "timed out"
+ * instead of deleting anything (H0-11: "bounded to about 8 s"). */
+export const FINAL_DRAIN_BUDGET_MS = 8000;
+
+let finalDrainBudgetOverrideMs: number | null = null;
+/** Test-only seam: overrides the deadline finalDrainConnection computes from FINAL_DRAIN_BUDGET_MS, so the
+ * 'timed-out' outcome can be exercised deterministically without an actual ~8s wait. Never used outside tests. */
+export function __setFinalDrainBudgetForTests(ms: number | null) { finalDrainBudgetOverrideMs = ms; }
+
+export interface FinalDrainOptions {
+  directory: string; spool: string; record: RegisteredObservation; store: Store;
+  receive(events: ObservationEvent[]): unknown;
+  /** Checked between spool records, never mid-file (drainObservationSpool's own closing() callback, reused
+   * as-is): a Cancel the owner pressed between connections, or the service shutting down. */
+  cancelled(): boolean;
+}
+export type FinalDrainOutcome = 'drained' | 'blocked' | 'timed-out' | 'cancelled';
+export interface FinalDrainResult {
+  /** 'drained': this connection had 0 pending events when the call returned — revoke and clean-up may run.
+   *  'blocked': delivery could not proceed (capacity, or a commit failure); reported once, never retried in
+   *  a tight loop, and revoke/clean-up must not run. 'timed-out': the roughly 8 s budget elapsed with events
+   *  still pending. 'cancelled': the caller's signal stopped the drain before it finished. Only 'drained'
+   *  ever means clean-up may delete anything. */
+  outcome: FinalDrainOutcome;
+  pendingEvents: number | null;
+  message: string | null;
+}
+
+/** Bounded, mutex-protected replay of ONE connection's pending spool before Stop watching may revoke it and
+ * clean up its files (H0-11). Waits for the shared drain mutex, then repeatedly calls the same bounded
+ * drainObservationSpool the periodic loop uses (so a spool with more files than one batch still finishes
+ * within the budget), until: 0 events are left, delivery reports 'blocked', the roughly 8 s budget elapses,
+ * or the caller's cancel/shutdown signal fires. Always releases the mutex on the way out, so it is never
+ * held between connections — Stop watching calls this once per connection, in its own turn. */
+export async function finalDrainConnection(options: FinalDrainOptions): Promise<FinalDrainResult> {
+  const release = await drainMutex.acquire();
+  try {
+    const deadline = Date.now() + (finalDrainBudgetOverrideMs ?? FINAL_DRAIN_BUDGET_MS);
+    const delivery = () => options.store.snapshot().state.observation?.connections.find(item => item.id === options.record.connection.id)?.delivery ?? null;
+    for (;;) {
+      if (options.cancelled()) return { outcome: 'cancelled', pendingEvents: delivery()?.pendingEvents ?? null, message: null };
+      await drainObservationSpool({ directory: options.directory, spool: options.spool, record: options.record, store: options.store, receive: options.receive, closing: options.cancelled });
+      if (options.cancelled()) return { outcome: 'cancelled', pendingEvents: delivery()?.pendingEvents ?? null, message: null };
+      const status = delivery();
+      if (!status || status.status === 'idle') return { outcome: 'drained', pendingEvents: 0, message: null };
+      if (status.status === 'blocked') return { outcome: 'blocked', pendingEvents: status.pendingEvents, message: status.message };
+      if (Date.now() >= deadline) return { outcome: 'timed-out', pendingEvents: status.pendingEvents, message: status.message };
+      // status is 'pending' (more files than one batch, or a fresh coverage/source claim to process next
+      // cycle): loop again, still inside the same acquired mutex, still bounded by the deadline above.
+    }
+  } finally { release(); }
 }

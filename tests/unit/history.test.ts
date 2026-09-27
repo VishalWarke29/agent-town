@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import Database from 'better-sqlite3';
 import Fastify from 'fastify';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import type { Handoff, ObservationConnection, ObservationEvent } from '@agent-town/contracts';
+import type { Handoff, NativeHideAllCounts, NativeSource, ObservationConnection, ObservationEvent } from '@agent-town/contracts';
 import { Store } from '../../apps/service/src/store';
 import { privateState } from '../../apps/service/src/workspaces';
 import { applyObservation } from '../../apps/service/src/observation/reducer';
@@ -76,6 +76,44 @@ describe('durable session history', () => {
     }
   });
 
+  it('keeps hide-all separate from archive: nothing is archived or deleted, reports stay readable, and the hidden state survives a restart (H0-12)', () => {
+    let source!: NativeSource;
+    store.commit('native-hide-source', () => { source = store.native.register('codex', 'C:\\fixture-native', 'Fixture native profile'); return 'observation.native_source_registered'; });
+    const nativeConnection: ObservationConnection = { ...connection, id: 'native-fixture-connection', nativeSourceId: source.id, sourceRevision: source.revision, binding: 'declared' };
+    const nativeEvent = (id: string, session: string, kind: ObservationEvent['kind'], summary?: string): ObservationEvent =>
+      ({ id, sessionId: session, nativeSessionId: session, nativeSourceId: source.id, sourceRevision: source.revision, kind, occurredAt: timestamp(), ...(summary ? { summary } : {}) });
+    const receiveNative = (value: ObservationEvent) => store.commit(`observe-native:${source.id}:${value.id}`, (state, now) => store.native.receive(state, nativeConnection, value, now) ?? 'observation.legacy');
+    // One finished session is archived on purpose first; the hide-all below must not touch it.
+    receiveNative(nativeEvent('finished', 'session-finished', 'session.end'));
+    archive();
+    receiveNative(nativeEvent('start-a', 'session-a', 'tool.start')); receiveNative(nativeEvent('report-a', 'session-a', 'turn.end', 'A saved report that must outlive hiding.')); receiveNative(nativeEvent('start-b', 'session-b', 'tool.start'));
+    const state = store.snapshot().state, reported = state.agents.find(agent => agent.observation?.sessionId === 'session-a')!;
+    const archiveBefore = store.history(), archivedCount = store.diagnostics().archivedAgents;
+    expect(state.agents).toHaveLength(2); expect(archiveBefore.total).toBe(1); expect(archivedCount).toBe(1);
+
+    let counts: NativeHideAllCounts | undefined;
+    store.commit('hide-all-fixture', (current, now) => { counts = store.native.hideProject(connection.repoId, current, now); return 'observation.native_visibility_bulk'; });
+    expect(counts).toEqual({ hidden: 2, alreadyHidden: 0, skippedLegacy: 0 });
+
+    const check = () => {
+      const after = store.snapshot().state;
+      expect(after.agents).toHaveLength(0);
+      // Hide is not archive: no archive row was added or changed, and a hidden session is not an archived one.
+      expect(store.history()).toEqual(archiveBefore); expect(store.diagnostics().archivedAgents).toBe(archivedCount); expect(after.history?.archivedAgents).toBe(archivedCount);
+      expect(() => store.historyDetail(reported.id)).toThrowError(expect.objectContaining({ code: 'HISTORY_NOT_FOUND' }));
+      // Its saved report is still readable, and the session can still be opened from the inventory.
+      expect(store.agentReports(reported.id)).toMatchObject({ reportCount: 1, reports: [{ summary: 'A saved report that must outlive hiding.' }] });
+      expect(store.native.detail(reported.id, after)).toMatchObject({ id: reported.id, activity: 'reporting' });
+      expect(store.native.page(after, { includeOlder: true }).items.filter(item => item.visibility === 'hidden')).toHaveLength(2);
+    };
+    check();
+    store.close(); store = new Store(join(folder, 'town.sqlite'), seed());
+    check();
+    // A later event neither un-hides the session nor archives it.
+    receiveNative({ ...nativeEvent('tool-later', 'session-b', 'tool.start'), occurredAt: new Date(Date.now() + 1000).toISOString() });
+    expect(store.snapshot().state.agents).toHaveLength(0); expect(store.history()).toEqual(archiveBefore);
+  });
+
   it('retains identity, reports and repository metadata across archive and restart without a live character', () => {
     receive(event('report-one', 'turn.end', 1, { summary: 'Fixture report', files: ['src/example.ts'] }));
     receive(event('end-one', 'session.end', 2));
@@ -108,6 +146,45 @@ describe('durable session history', () => {
     expect(store.history().total).toBe(0);
     expect(store.snapshot().state.handoffs).toHaveLength(1);
     expect(() => store.archiveAgent(id, originalReview.reviewToken)).toThrow('session changed');
+  });
+
+  it('journals an observation event on a full activity list in about a kilobyte, not a rewrite of every row', () => {
+    store.commit('fill-activity', state => {
+      state.activity = Array.from({ length: 500 }, (_, index) => ({ id: `seed-activity-${index}`, message: `Earlier event ${index} in the retained activity list`, createdAt: timestamp(), kind: 'work' as const }));
+      return 'demo.tick';
+    });
+    receive(event('warm-up', 'session.start', 1));
+    const before = store.diagnostics();
+    for (let index = 0; index < 20; index++) receive(event(`tool-${index}`, 'tool.start', 2 + index, { tool: 'Read' }));
+    const after = store.diagnostics();
+    expect(store.snapshot().state.activity).toHaveLength(500);
+    expect(after.events - before.events).toBe(20);
+    expect((after.eventBytes - before.eventBytes) / 20).toBeLessThan(2500);
+  });
+
+  it('lets a finished child session be archived without treating an idle parent as ended, then resumes it on new work', () => {
+    const child = (id: string, kind: ObservationEvent['kind'], sequence: number, extra: Partial<ObservationEvent> = {}) =>
+      event(id, kind, sequence, { sessionId: 'child-session', parentSessionId: 'session-one', ...extra });
+    receive(event('parent-start', 'session.start', 1));
+    receive(child('child-start', 'session.start', 1));
+    const review = (role: 'parent' | 'child') => { const state = store.snapshot().state; return archiveReview(state, state.agents.find(agent => role === 'child' ? agent.observation?.parentSessionId : !agent.observation?.parentSessionId)!); };
+    expect(review('child').allowed).toBe(false);
+    receive(child('child-stop', 'turn.end', 2, { summary: 'Child finished its part.' }));
+    const finished = store.snapshot().state.agents.find(agent => agent.observation?.parentSessionId)!;
+    expect(finished.activity).toBe('reporting');
+    expect(review('child')).toMatchObject({ allowed: true, reasons: [], reportCount: 1 });
+    receive(child('child-idle', 'turn.end', 3));
+    expect(store.snapshot().state.agents.find(agent => agent.observation?.parentSessionId)!.activity).toBe('idle');
+    expect(review('child').allowed).toBe(true);
+    receive(event('parent-stop', 'turn.end', 2));
+    expect(review('parent')).toMatchObject({ allowed: false });
+    store.archiveAgent(finished.id, review('child').reviewToken);
+    expect(store.snapshot().state.agents).toHaveLength(1);
+    expect(store.history().total).toBe(1);
+    expect(store.historyDetail(finished.id)).toMatchObject({ reportCount: 1, agent: { observation: { parentSessionId: 'session-one' } } });
+    receive(child('child-resume', 'turn.start', 4, { occurredAt: new Date(Date.now() + 1000).toISOString() }));
+    expect(store.snapshot().state.agents.find(agent => agent.id === finished.id)).toMatchObject({ activity: 'working' });
+    expect(store.history().total).toBe(0);
   });
 
   it('supports more than 200 lifetime sessions through explicit archive while retaining every session identity', () => {
@@ -207,5 +284,39 @@ describe('durable session history', () => {
       expect((await app.inject(`/api/v1/workspaces/fixture-workspace/agents/${id}/reports`)).json()).toEqual({ reports: [], reportCount: 0, reportsNextOffset: null });
       expect((await app.inject(`/api/v1/workspaces/other/history/agents/${id}`)).statusCode).toBe(404);
     } finally { await app.close(); }
+  });
+
+  it('review tokens ignore scan/discoveryStatus/picture fields but still change on a real blocking-relevant change', () => {
+    receive(event('end', 'session.end', 1));
+    const state = store.snapshot().state;
+    const agent = state.agents[0]!;
+    const before = archiveReview(state, agent).reviewToken;
+
+    // A background rescan updating repository.scan/discoveryStatus, and the agent's own
+    // updatedAt/files/evidence churning, must never change the token.
+    const rescanned = structuredClone(state);
+    const repo = rescanned.repositories.find(r => r.id === agent.repoId)!;
+    repo.scan = { at: timestamp(), coverage: 'complete', reasons: [] };
+    repo.discoveryStatus = { state: 'stale', checkedAt: timestamp(), lastVerifiedAt: null, reasons: ['drifted'] };
+    const rescannedAgent = { ...agent, updatedAt: timestamp(), files: ['a.ts', 'b.ts'], evidence: 'different evidence text' };
+    expect(archiveReview(rescanned, rescannedAgent).reviewToken).toBe(before);
+
+    // A real, blocking-relevant change (activity) must change the token.
+    const changed = { ...agent, activity: agent.activity === 'idle' ? 'working' as const : 'idle' as const };
+    expect(archiveReview(state, changed).reviewToken).not.toBe(before);
+  });
+
+  it('root-removal review tokens ignore scan/discoveryStatus/picture fields but still change when a repository is added or its root changes', () => {
+    const state = store.snapshot().state;
+    const before = rootRemovalReview(state, 'C:\\fixture-projects').reviewToken;
+
+    const rescanned = structuredClone(state);
+    rescanned.repositories[0]!.scan = { at: timestamp(), coverage: 'complete', reasons: [] };
+    rescanned.repositories[0]!.discoveryStatus = { state: 'stale', checkedAt: timestamp(), lastVerifiedAt: null, reasons: ['drifted'] };
+    expect(rootRemovalReview(rescanned, 'C:\\fixture-projects').reviewToken).toBe(before);
+
+    const withExtraRepo = structuredClone(state);
+    withExtraRepo.repositories.push({ id: 'second-repo', name: 'Second', source: 'local', localPath: 'C:\\fixture-projects\\second', selectedRoot: 'C:\\fixture-projects', description: '', language: 'Unavailable', branch: 'main', color: '#bbbbbb', position: [9, 9] });
+    expect(rootRemovalReview(withExtraRepo, 'C:\\fixture-projects').reviewToken).not.toBe(before);
   });
 });
