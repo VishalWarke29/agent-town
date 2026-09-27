@@ -1,9 +1,20 @@
 # This workflow only actually runs once/if this repository is pushed to a GitHub remote.
 #
 # Unit/type-check CI only: this intentionally does NOT run the Playwright end-to-end
-# suite (npm run test:e2e), since it needs a real browser and Windows-specific
-# launcher behavior that doesn't apply to a standard Linux CI runner. Browser e2e
-# coverage is run separately/locally for now.
+# suite (npm run test:e2e), since it needs a real browser and a real Windows launch
+# environment beyond what a hosted runner offers. Browser e2e coverage is run
+# separately/locally for now.
+#
+# Runner is windows-latest, not ubuntu-latest: Agent Town is a Windows-only local app
+# (per AGENTS.md/CLAUDE.md), and several unit tests intentionally verify real Windows
+# filesystem semantics (e.g. the read-only file attribute blocking a rename) that a
+# Linux runner cannot reproduce and were never meant to run there.
+#
+# The build step matters, not just the type-check: several observation/tool-detection
+# tests need the real service build output (apps/service/dist/hook-bridge.cjs) to exist
+# — it is gitignored, so a fresh checkout has none until this step creates it. Without
+# it, those tests get a real "not built on this computer" refusal instead of exercising
+# the behavior under test.
 name: CI
 
 on:
@@ -12,7 +23,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -21,4 +32,5 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      - run: npm run build
       - run: npm test
