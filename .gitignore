@@ -4,6 +4,10 @@ dist/
 tmp/
 .codex/
 .claude/
+AGENTS.md
+agents.md
+CLAUDE.md
+claude.md
 /docs/
 agent-town.config.json
 .env
