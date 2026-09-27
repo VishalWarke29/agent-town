@@ -30,6 +30,32 @@ jobs:
         with:
           node-version: 24.x
           cache: npm
+      # GitHub's hosted windows-latest image places the runneradmin profile's %TEMP% under a
+      # junction onto the D: scratch disk. Node's os.tmpdir() (and every test fixture that calls
+      # it) inherits that path, and this app's own path-safety check (checkedPath/canonicalizeRoot
+      # in apps/service/src/discovery/paths.ts) deliberately walks and refuses every symlinked path
+      # component — correct behavior for a real user-chosen project folder, but it means almost
+      # every fixture that scratches under the default temp dir gets refused as "unsafe-root" on
+      # this specific hosted image, not on a real end-user Windows machine. Fix: point TEMP/TMP at
+      # RUNNER_TEMP directly (GitHub's own documented, already-real, non-junctioned scratch dir on
+      # D:, always set as a plain env var — no expression-context restrictions) via $GITHUB_ENV, so
+      # every later step (including npm test) sees os.tmpdir() resolve there with a clean ancestor
+      # chain instead of through the junction. Also prints the reparse-point chain for visibility.
+      - name: Point TEMP/TMP at the runner's own non-junctioned scratch directory
+        shell: pwsh
+        run: |
+          Write-Host "Before: env:TEMP = $env:TEMP"
+          $path = $env:TEMP
+          while ($path) {
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            if ($item) { Write-Host "$path -> Attributes=$($item.Attributes) LinkType=$($item.LinkType) Target=$($item.Target)" }
+            $parent = Split-Path -Path $path -Parent
+            if ($parent -eq $path) { break }
+            $path = $parent
+          }
+          "TEMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "After (next steps only): TEMP/TMP = $env:RUNNER_TEMP"
       - run: npm ci
       - run: npm run check
       - run: npm run build
