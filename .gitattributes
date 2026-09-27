@@ -1,1 +1,9 @@
 * text=auto
+
+# Shipped migration files (and their journal) are content-hash-pinned in
+# tests/unit/migration-journal.test.ts to catch any edit to a released migration.
+# core.autocrlf would otherwise convert these to CRLF on a fresh Windows checkout
+# (confirmed: the git blob's own hash already matches every pinned value; only a
+# CRLF-converting checkout does not), breaking the pin on any platform/setting
+# combination that converts line endings on checkout. Force LF unconditionally.
+apps/service/drizzle/** text eol=lf
