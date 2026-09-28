@@ -71,7 +71,7 @@ describe('offline recovery', () => {
         const source = store.native.register('codex', join(item.root, 'native-home'), 'Native source'); sourceId = source.id;
         store.native.discover(source, 'native-repo', [{ nativeSessionId: 'native-session', title: 'Recover retained session work', nativeAgentName: 'Rowan', projectPath: join(item.root, 'native-project'), createdAt: now, updatedAt: now }], state, now);
         sessionId = store.native.page(state).items[0]!.id;
-        store.native.visibility(sessionId, false, state);
+        store.native.visibility(sessionId, false, state, now);
         return 'observation.native_fixture';
       });
     } finally { store.close(); }

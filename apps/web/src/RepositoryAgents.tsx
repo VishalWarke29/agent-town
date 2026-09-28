@@ -89,43 +89,42 @@ export function RepositoryAgents({ state, repoId, connected, selectedId, onSelec
   const hideConfirmRef = useRef<HTMLButtonElement>(null);
   const hiddenSummaryRef = useRef<HTMLElement>(null);
   const [pendingSummaryFocus, setPendingSummaryFocus] = useState(false);
+  // H0-33: a request-sequencing token, the same pattern LiveTrackingPanel.tsx's own `openSeq` already uses.
+  // Every loadHiddenPage() call (a fresh load, a "Load more" page, the includeOlder checkbox's reload, or the
+  // disclosure's own first-open fetch) captures the counter's value at its own start and only ever applies
+  // its own result while it is still the most recent one requested — so a slow response left over from
+  // project A cannot land after the house has moved on to project B, or after a newer request for the same
+  // house has already superseded it.
+  const hiddenSeq = useRef(0);
 
-  const loadHiddenPage = useCallback(async (includeOlderOverride?: boolean) => {
+  const loadHiddenPage = useCallback(async (options: { includeOlder?: boolean; cursor?: string; append?: boolean } = {}) => {
     if (!localProject) { setHiddenPage(null); return; }
+    const seq = ++hiddenSeq.current;
     setHiddenLoading(true); setHiddenError(null);
     try {
-      const params = new URLSearchParams({ repoId, visibility: 'hidden', includeOlder: String(includeOlderOverride ?? hiddenIncludeOlder) });
-      setHiddenPage(await residentsGet<NativeSessionPage>(`${prefix}/native-sessions?${params}`));
-    } catch (cause) { setHiddenError(cause instanceof Error ? cause.message : 'The hidden session list could not be loaded.'); }
-    finally { setHiddenLoading(false); }
+      const includeOlder = options.includeOlder ?? hiddenIncludeOlder;
+      const params = new URLSearchParams({ repoId, visibility: 'hidden', includeOlder: String(includeOlder) });
+      if (options.cursor) params.set('cursor', options.cursor);
+      const page = await residentsGet<NativeSessionPage>(`${prefix}/native-sessions?${params}`);
+      if (hiddenSeq.current !== seq) return; // superseded by a newer request while this one was in flight
+      setHiddenPage(previous => options.append && previous ? { ...page, items: [...previous.items, ...page.items] } : page);
+    } catch (cause) {
+      if (hiddenSeq.current !== seq) return;
+      setHiddenError(cause instanceof Error ? cause.message : 'The hidden session list could not be loaded.');
+    } finally { if (hiddenSeq.current === seq) setHiddenLoading(false); }
   }, [localProject, prefix, repoId, hiddenIncludeOlder]);
-  // H0-07 fix: this used to call loadHiddenPage() unconditionally on every mount, which sends a
-  // GET .../native-sessions?...&visibility=hidden the moment the house inspector's Residents slot
-  // renders. That broke several separately-pinned, foundational "this must read no session" guarantees:
-  // tests/browser/local-folder.spec.ts (tracing to D38/H0-02/H0-16: "nothing above Watch sends a
-  // request", H0-07's own acceptance line, for a freshly connected project with zero agents) AND, found
-  // only by running the FULL cross-cutting browser suite rather than trusting H0-15's own narrower
-  // targeted run, two files outside this item's owned list that were already broken by H0-15's original,
-  // unconditional call and never caught before now — tests/browser/session-names.spec.ts and
-  // tests/browser/session-hierarchy.spec.ts, both of which seed native-backed (discovery.sourceId)
-  // residents and assert zero "unexpected" (unmocked) requests once the house/roster is open. An earlier
-  // version of this fix tried gating on nativeBackedCount > 0 (only skip the request when NO native-
-  // backed resident is currently visible); that still fired for those two files' fixtures, which do have
-  // native-backed residents, so it was not enough — removed entirely instead, in favour of loading
-  // lazily, only from an explicit action.
-  // Reload only when the house (or its connection status) changes; the checkbox below reloads itself
-  // explicitly with the new value, since state updates are not visible inside this same tick. No longer
-  // fetches on mount at all: the hide/show handlers below already call loadHiddenPage() explicitly after
-  // their own action, which is all this component's own H0-15 browser tests (the Residents hide/show
-  // flow, both world and List view) actually exercise or assert on — none of them checks that a hidden
-  // count is known before some hide/show action happens in the same session.
-  // Known, disclosed gap this leaves: a house whose sessions were ALL hidden in an EARLIER page load (so
-  // no hide/show action happens in THIS one) will not show "N hidden · Show" again until a new hide or
-  // show action happens in this session — it is not re-checked merely by reopening the drawer. The real
-  // fix is carrying a hidden count in the town snapshot itself (packages/contracts + apps/service,
-  // outside this item's owned files) so no separate request is ever needed; flagged for whoever owns
-  // that area next, alongside this item's own evidence note.
-  useEffect(() => { setConfirmHide(false); setHideError(null); setHiddenError(null); setShowNotice(null); setHiddenIncludeOlder(false); setHiddenPage(null); }, [repoId, localProject]);
+  // H0-07 fix, extended by H0-33: this must never fetch merely because the component mounts or repoId
+  // changes — tests/browser/local-folder.spec.ts (and, less directly, session-names.spec.ts and
+  // session-hierarchy.spec.ts) pin that nothing above an explicit Watch/hide/show action sends a request for
+  // a freshly opened house. loadHiddenPage() above is still only ever called from an explicit trigger: a
+  // hide/show action below, the includeOlder checkbox, a "Load more" click, or this disclosure's own
+  // onToggle handler the first time a user actually opens it (see the JSX below) — never from a bare mount.
+  // H0-33 closes the gap that reliance on those triggers alone used to leave: the "N hidden · Show" badge
+  // itself no longer depends on any of them having fired. It reads hiddenSessionCount below, a read-time
+  // overlay the server now carries on every snapshot and live push (store.ts's withHiddenCounts), so a house
+  // whose sessions were hidden in an earlier page load shows its badge again immediately on a fresh load —
+  // with zero additional requests. Only the LIST underneath (hiddenPage) still needs an explicit fetch.
+  useEffect(() => { hiddenSeq.current++; setConfirmHide(false); setHideError(null); setHiddenError(null); setShowNotice(null); setHiddenIncludeOlder(false); setHiddenPage(null); }, [repoId, localProject]);
   // A result banner takes focus once it actually reflects the action that produced it (DES-02 section 6):
   // requestAnimationFrame right after the triggering await is not reliable here, because the <details> this
   // moves focus into can be mounting for the very first time from data a second, still-pending fetch
@@ -154,6 +153,12 @@ export function RepositoryAgents({ state, repoId, connected, selectedId, onSelec
     } catch (cause) { setShowNotice(cause instanceof Error ? cause.message : 'This session could not be shown.'); }
     finally { setShowBusyId(null); }
   };
+  // H0-33: prefer the live overlay (always current, including a house whose sessions were hidden in an
+  // earlier page load); fall back to an already-fetched page's own hiddenTotal only when the overlay is
+  // absent (an older or hand-built Snapshot, e.g. some test fixtures) so nothing regresses before every
+  // producer of a Snapshot carries the new field. Both describe the exact same count (every hidden session
+  // for this repository, across every source, with no 30-day window — see hiddenTotal's own contract note).
+  const hiddenSessionCount = state.repositories.find(repo => repo.id === repoId)?.hiddenSessionCount ?? hiddenPage?.hiddenTotal ?? 0;
 
   return <section className="repository-agents" data-testid="repository-agents" data-slot="residents" data-repo-id={repoId} aria-label="Agents in this repository">
     <div className="section-summary"><h3><Users size={17} />Residents</h3><span>{state.workspace.mode === 'demo' ? `${residents.length} sample` : `${sessionSummary(savedResidents)} in town`}</span></div>
@@ -164,8 +169,8 @@ export function RepositoryAgents({ state, repoId, connected, selectedId, onSelec
       <button ref={hideConfirmRef} type="button" className="button primary" style={{ minHeight: 44 }} disabled={hideBusy} onClick={() => void confirmHideAll()}>{hideBusy ? 'Hiding…' : `Yes, hide these ${nativeBackedCount} sessions`}</button>
       <button type="button" className="text-button" disabled={hideBusy} onClick={cancelHide}>Cancel</button>
     </div>}
-    {localProject && (hiddenPage?.hiddenTotal ?? 0) > 0 && <details data-testid="hidden-sessions">
-      <summary ref={hiddenSummaryRef} style={{ minHeight: 44, display: 'flex', alignItems: 'center', cursor: 'pointer', fontWeight: 600 }}>{hiddenPage!.hiddenTotal} session{hiddenPage!.hiddenTotal === 1 ? '' : 's'} hidden · Show</summary>
+    {localProject && hiddenSessionCount > 0 && <details data-testid="hidden-sessions" onToggle={event => { if (event.currentTarget.open && !hiddenPage && !hiddenLoading) void loadHiddenPage(); }}>
+      <summary ref={hiddenSummaryRef} style={{ minHeight: 44, display: 'flex', alignItems: 'center', cursor: 'pointer', fontWeight: 600 }}>{hiddenSessionCount} session{hiddenSessionCount === 1 ? '' : 's'} hidden · Show</summary>
       <p className="muted small">Hidden sessions leave town but stay in history. Sessions hidden in the last 30 days are listed here; older ones stay hidden until you include them below.</p>
       {showNotice && <p className="form-notice" role="status">{showNotice}</p>}
       {hiddenError && <p className="form-error" role="alert">{hiddenError}</p>}
@@ -176,7 +181,11 @@ export function RepositoryAgents({ state, repoId, connected, selectedId, onSelec
       </li>)}</ul>}
       {hiddenPage && !hiddenLoading && hiddenPage.items.length === 0 && <p className="muted small">No hidden sessions from the last 30 days{hiddenIncludeOlder ? '.' : '. Include older sessions below to see more.'}</p>}
       {hiddenPage && hiddenPage.items.length < hiddenPage.total && <p className="muted small">Showing the first {hiddenPage.items.length} of {hiddenPage.total} matching hidden sessions.</p>}
-      <div className="setup-form"><label className="check-setting"><input type="checkbox" checked={hiddenIncludeOlder} onChange={event => { const value = event.target.checked; setHiddenIncludeOlder(value); void loadHiddenPage(value); }} /><span>Include sessions hidden more than 30 days ago</span></label></div>
+      {/* H0-33: real pagination — a "26+ rows accessible" acceptance criterion the earlier static sentence
+          above could not satisfy on its own. Appends to the existing list rather than replacing it
+          (loadHiddenPage's own `append` option), and only renders while the server says more remain. */}
+      {hiddenPage?.nextCursor && <button type="button" className="text-button" style={{ minHeight: 44 }} disabled={hiddenLoading} onClick={() => void loadHiddenPage({ cursor: hiddenPage.nextCursor ?? undefined, append: true })}>{hiddenLoading ? 'Loading…' : 'Load more hidden sessions'}</button>}
+      <div className="setup-form"><label className="check-setting"><input type="checkbox" checked={hiddenIncludeOlder} onChange={event => { const value = event.target.checked; setHiddenIncludeOlder(value); void loadHiddenPage({ includeOlder: value }); }} /><span>Include sessions hidden more than 30 days ago</span></label></div>
     </details>}
     {showControls && onShowChildAgents && <ChildAgentControl count={hierarchy.children.length} checked={showChildAgents} onChange={onShowChildAgents} />}
     {!connected && <p className="room-notice" role="status">Reconnecting · showing last reported activity.</p>}

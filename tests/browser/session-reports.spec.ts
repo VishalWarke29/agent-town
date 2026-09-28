@@ -142,7 +142,7 @@ test('hidden native inventory sessions expose saved reports without adding a cha
     expect(id).toBe('hidden');
     await route.fulfill({ json: { reports: [{ ...reports[0]!, agentId: id }], reportCount: 1, reportsNextOffset: null } satisfies AgentReportPage });
   });
-  const item: NativeSession = { id: 'hidden-record', agentId: hiddenAgent.id, sourceId, provider: 'codex', nativeSessionId: 'native-hidden', repoId: 'project', createdAt: stamp, nativeUpdatedAt: stamp, discoveredAt: stamp, observedAt: null, visible: false, visibility: 'hidden', sceneVisible: false, activity: 'unknown' };
+  const item: NativeSession = { id: 'hidden-record', agentId: hiddenAgent.id, sourceId, provider: 'codex', nativeSessionId: 'native-hidden', repoId: 'project', createdAt: stamp, nativeUpdatedAt: stamp, discoveredAt: stamp, observedAt: null, visible: false, visibility: 'hidden', hiddenAt: stamp, sceneVisible: false, activity: 'unknown' };
   const setup: NativeSetupSnapshot = { sources: [{ id: sourceId, provider: 'codex', label: 'Fixture profile', status: 'ready', discovery: 'available', lastScanAt: stamp, message: null, revision: 1 }], tools: [{ provider: 'codex', label: 'Codex', detected: true, discovery: 'available', version: 'fixture-version', message: 'Synthetic metadata only.', defaultHomePath: null }] };
   const inventoryCalls: { method: string; path: string }[] = [];
   await page.route('**/api/v1/workspaces/reports-fixture/observation/**', async route => {

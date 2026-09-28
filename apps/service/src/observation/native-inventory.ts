@@ -147,6 +147,10 @@ export class NativeInventory {
     const agent: Agent = { ...original, ...(latest ? { activity: latest.activity, observation: structuredClone(latest.observation!), updatedAt: latest.updatedAt, evidence: latest.evidence } : {}),
       files: [...new Set(candidates.flatMap(candidate => candidate.files))].slice(0, 100) };
     const visibility = sessions.some(session => session.visibility === 'hidden') ? 'hidden' : sessions.some(session => session.visibility === 'shown') ? 'shown' : 'auto';
+    // Preserve the most informative (latest known) hiddenAt among whichever merged rows were actually
+    // hidden; null (never falls back to a merge partner's stale/irrelevant value) when the merge result is
+    // not hidden, or when every hidden row's own hiddenAt is itself unknown (pre-H0-33 data).
+    const hiddenAt = visibility === 'hidden' ? sessions.filter(session => session.visibility === 'hidden').reduce<string | null>((time, session) => laterTime(time, session.hiddenAt ?? null), null) : null;
     const live = state.agents.find(candidate => candidate.id === winner.id) ?? state.agents.find(candidate => ids.has(candidate.id));
     const archived = unique.map(row => this.archive(row.id)).find((record): record is ArchivedAgent => !!record);
     state.agents = state.agents.filter(candidate => !ids.has(candidate.id));
@@ -166,7 +170,7 @@ export class NativeInventory {
     }
     const title = sessions.filter(session => session.title).sort((left, right) => Date.parse(right.nativeUpdatedAt ?? right.discoveredAt) - Date.parse(left.nativeUpdatedAt ?? left.discoveredAt))[0]?.title;
     const nativeAgentName = sessions.filter(session => session.nativeAgentName).sort((left, right) => Date.parse(right.nativeUpdatedAt ?? right.discoveredAt) - Date.parse(left.nativeUpdatedAt ?? left.discoveredAt))[0]?.nativeAgentName;
-    const session: NativeSession = { ...sessions[0]!, ...(title ? { title } : {}), ...(nativeAgentName ? { nativeAgentName } : {}), visibility, visible: visibility === 'hidden' ? false : sessions.some(value => value.visible), sceneVisible: state.agents.some(candidate => candidate.id === winner.id),
+    const session: NativeSession = { ...sessions[0]!, ...(title ? { title } : {}), ...(nativeAgentName ? { nativeAgentName } : {}), visibility, hiddenAt, visible: visibility === 'hidden' ? false : sessions.some(value => value.visible), sceneVisible: state.agents.some(candidate => candidate.id === winner.id),
       activity: agent.activity, observedAt: sessions.reduce<string | null>((time, value) => laterTime(time, value.observedAt), null), nativeUpdatedAt: sessions.reduce<string | null>((time, value) => laterTime(time, value.nativeUpdatedAt), null) };
     this.save(session, agent);
     state.history = { archivedAgents: (this.db.prepare('SELECT count(*) AS count FROM agent_archive').get() as { count: number }).count, updatedAt: new Date().toISOString() };
@@ -206,13 +210,13 @@ export class NativeInventory {
           if (!row && legacyId && legacyId !== found) {
             const previousActor = this.actor(legacyId, state)!;
             this.save({ id: legacyId, agentId: legacyId, sourceId: source.id, provider: source.provider, nativeSessionId: `legacy-${hash(legacyId)}`, repoId,
-              createdAt: null, nativeUpdatedAt: null, discoveredAt: now, observedAt: previousActor.observation ? previousActor.updatedAt : null, visible: state.agents.some(agent => agent.id === legacyId), visibility: 'auto', sceneVisible: state.agents.some(agent => agent.id === legacyId), activity: previousActor.activity }, previousActor);
+              createdAt: null, nativeUpdatedAt: null, discoveredAt: now, observedAt: previousActor.observation ? previousActor.updatedAt : null, visible: state.agents.some(agent => agent.id === legacyId), visibility: 'auto', hiddenAt: null, sceneVisible: state.agents.some(agent => agent.id === legacyId), activity: previousActor.activity }, previousActor);
             row = this.row(legacyId);
           }
           if (!row) { legacyId = found; row = existingRow; continue; }
           if (!existingRow) {
             const adopted: NativeSession = { id: found, agentId: found, sourceId: source.id, provider: source.provider, nativeSessionId: `legacy-${hash(found)}`, repoId,
-              createdAt: null, nativeUpdatedAt: null, discoveredAt: now, observedAt: actor.observation ? actor.updatedAt : null, visible: state.agents.some(agent => agent.id === found), visibility: 'auto', sceneVisible: state.agents.some(agent => agent.id === found), activity: actor.activity };
+              createdAt: null, nativeUpdatedAt: null, discoveredAt: now, observedAt: actor.observation ? actor.updatedAt : null, visible: state.agents.some(agent => agent.id === found), visibility: 'auto', hiddenAt: null, sceneVisible: state.agents.some(agent => agent.id === found), activity: actor.activity };
             this.save(adopted, actor);
           }
           row = this.mergeVerified([row, this.row(found)!], state, existingRow ? undefined : row.native_id.startsWith('legacy-') ? row.id : found);
@@ -230,7 +234,7 @@ export class NativeInventory {
       const nativeAgentName = parsedAgentName.success ? parsedAgentName.data : previous?.nativeAgentName;
       const session: NativeSession = { id, agentId: id, sourceId: source.id, provider: source.provider, nativeSessionId: item.nativeSessionId,
         ...(parent ? { parentNativeSessionId: parent } : {}), ...(title ? { title } : {}), ...(nativeAgentName ? { nativeAgentName } : {}), repoId, createdAt: previous?.createdAt ?? item.createdAt, nativeUpdatedAt: laterTime(previous?.nativeUpdatedAt ?? null, item.updatedAt),
-        discoveredAt: previous?.discoveredAt ?? now, observedAt: previous?.observedAt ?? null, visible: previous?.visible ?? !!state.agents.find(agent => agent.id === id), visibility: previous?.visibility ?? 'auto', sceneVisible: state.agents.some(agent => agent.id === id), activity: previous?.activity ?? 'unknown' };
+        discoveredAt: previous?.discoveredAt ?? now, observedAt: previous?.observedAt ?? null, visible: previous?.visible ?? !!state.agents.find(agent => agent.id === id), visibility: previous?.visibility ?? 'auto', hiddenAt: previous?.hiddenAt ?? null, sceneVisible: state.agents.some(agent => agent.id === id), activity: previous?.activity ?? 'unknown' };
       const agent = this.actor(id, state) ?? this.makeAgent(session, state);
       session.observedAt ??= agent.observation ? agent.updatedAt : null;
       session.title ??= agent.discovery?.title;
@@ -242,6 +246,22 @@ export class NativeInventory {
       if (item.parentNativeSessionId) this.saveAlias(childAlias(source.id, item.parentNativeSessionId, item.nativeSessionId), id);
     }
   }
+  /** H0-33: the read-only overlay Store.snapshot() merges onto each repository so a house shows "N hidden ·
+   * Show" the instant its state loads, with no separate request needed just to learn a hidden count exists.
+   * One query keyed on the already-indexed repo_id column for every requested repository at once (never one
+   * query per repository), then filtered to visibility 'hidden' in JS — `data` is a JSON blob with no
+   * expression index today, and at the realistic scale here (at most ~100 repositories, a few thousand
+   * sessions) that is already cheap; a new SQL expression index is deliberately out of scope. Never writes
+   * anything back to native_sessions. */
+  hiddenCounts(repoIds: string[]): Record<string, number> {
+    const ids = [...new Set(repoIds)];
+    if (!ids.length) return {};
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = this.db.prepare(`SELECT repo_id,data FROM native_sessions WHERE repo_id IN (${placeholders})`).all(...ids) as { repo_id: string; data: string }[];
+    const counts: Record<string, number> = {};
+    for (const row of rows) if ((JSON.parse(row.data) as NativeSession).visibility === 'hidden') counts[row.repo_id] = (counts[row.repo_id] ?? 0) + 1;
+    return counts;
+  }
   page(state: TownState, options: { repoId?: string; sourceId?: string; cursor?: string; includeOlder?: boolean; visibility?: 'hidden' } = {}): NativeSessionPage {
     const offset = options.cursor === undefined ? 0 : Number(options.cursor);
     if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100_000) throw new IdentityError('INVALID_CURSOR', 'Refresh the session list and try again.');
@@ -252,7 +272,14 @@ export class NativeInventory {
     // even on a page that would not otherwise list it without includeOlder.
     const hiddenTotal = all.filter(item => item.visibility === 'hidden').length;
     const cutoff = Date.now() - 30 * 86400000;
-    const items = all.filter(item => (options.includeOlder || Date.parse(item.observedAt ?? item.nativeUpdatedAt ?? item.discoveredAt) >= cutoff) && (!options.visibility || item.visibility === options.visibility))
+    // H0-33: the window answers "how recently did this become the state it's in now", which for a hidden
+    // session is when it was HIDDEN (hiddenAt), never its last activity time — a session hidden today with
+    // 6-month-stale activity must still appear in the default (non-includeOlder) view. hiddenAt is null on a
+    // session an older build hid before this field existed; that is genuinely unknown, so it conservatively
+    // behaves as hidden long ago (excluded by default, still reachable with includeOlder) rather than
+    // guessing a wrong timestamp. Every other (non-hidden) case keeps today's unrelated activity-time cutoff.
+    const cutoffBasis = (item: NativeSession) => item.visibility === 'hidden' ? item.hiddenAt : (item.observedAt ?? item.nativeUpdatedAt ?? item.discoveredAt);
+    const items = all.filter(item => { const basis = cutoffBasis(item); return (options.includeOlder || (!!basis && Date.parse(basis) >= cutoff)) && (!options.visibility || item.visibility === options.visibility); })
       .sort((a, b) => (b.observedAt ?? b.nativeUpdatedAt ?? b.discoveredAt).localeCompare(a.observedAt ?? a.nativeUpdatedAt ?? a.discoveredAt) || a.id.localeCompare(b.id));
     return { items: items.slice(offset, offset + 25).map(item => { const live = state.agents.find(agent => agent.id === item.agentId); return { ...item, sceneVisible: !!live, activity: live?.activity ?? item.activity }; }), total: items.length, nextCursor: offset + 25 < items.length ? String(offset + 25) : null, hiddenTotal };
   }
@@ -268,7 +295,7 @@ export class NativeInventory {
    * behaviour: it marks the session shown without ever placing it in town if the town is already full.
    * The real "Show in town" HTTP route passes 'refuse' instead, so a session actually stays 'hidden' (findable
    * and reversible) rather than silently losing both its town slot and its place on the hidden list. */
-  visibility(id: string, visible: boolean, state: TownState, options: { onLimit?: 'silent' | 'refuse' } = {}): void {
+  visibility(id: string, visible: boolean, state: TownState, now: string, options: { onLimit?: 'silent' | 'refuse' } = {}): void {
     this.writing();
     id = this.alias(actorAlias(id)) ?? id;
     const row = this.row(id);
@@ -276,7 +303,7 @@ export class NativeInventory {
     const session = JSON.parse(row.data) as NativeSession, agent = this.actor(id, state) ?? this.makeAgent(session, state);
     if (visible && !state.repositories.some(repo => repo.id === session.repoId)) throw new IdentityError('LOCAL_REPOSITORY_REQUIRED', 'Reconnect this project before showing its session in town.', 409);
     if (visible && options.onLimit === 'refuse' && !state.agents.some(actor => actor.id === id) && state.agents.length >= RETAINED_AGENT_LIMIT) throw new IdentityError('NATIVE_RESIDENT_LIMIT', 'Town is full at 200 residents. Hide one to show this.', 429);
-    session.visible = visible; session.visibility = visible ? 'shown' : 'hidden';
+    session.visible = visible; session.visibility = visible ? 'shown' : 'hidden'; session.hiddenAt = visible ? null : now;
     if (!visible) state.agents = state.agents.filter(actor => actor.id !== id);
     else if (!state.agents.some(actor => actor.id === id) && state.agents.length < RETAINED_AGENT_LIMIT) {
       agent.home = allocateAgentHome(agent.repoId, state.repositories, state.agents); state.agents.push(agent);
@@ -331,7 +358,7 @@ export class NativeInventory {
     if (!rows.length) return counts;
     for (const row of rows) {
       const session = sessionData(row), agent = this.actor(row.id, state) ?? this.makeAgent(session, state);
-      session.visible = false; session.visibility = 'hidden'; session.sceneVisible = false;
+      session.visible = false; session.visibility = 'hidden'; session.hiddenAt = now; session.sceneVisible = false;
       this.save(session, agent);
     }
     const hidden = new Set(rows.map(row => row.id));
@@ -354,7 +381,7 @@ export class NativeInventory {
     const parent = event.nativeParentSessionId ?? existing?.parentNativeSessionId;
     if (existing && existing.repoId !== connection.repoId) throw new IdentityError('NATIVE_PROJECT_CONFLICT', 'This session belongs to a different selected project.', 409);
     const session: NativeSession = existing ?? { id, agentId: id, sourceId: source.id, provider: source.provider, nativeSessionId: nativeId,
-      ...(parent ? { parentNativeSessionId: parent } : {}), repoId: connection.repoId, createdAt: null, nativeUpdatedAt: null, discoveredAt: now, observedAt: null, visible: true, visibility: 'auto', sceneVisible: false, activity: 'unknown' };
+      ...(parent ? { parentNativeSessionId: parent } : {}), repoId: connection.repoId, createdAt: null, nativeUpdatedAt: null, discoveredAt: now, observedAt: null, visible: true, visibility: 'auto', hiddenAt: null, sceneVisible: false, activity: 'unknown' };
     if (session.visibility !== 'hidden') session.visible = true;
     const agent = this.actor(id, state) ?? this.makeAgent(session, state);
     const previousObservation = agent.observation && structuredClone(agent.observation);

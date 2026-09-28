@@ -42,6 +42,13 @@ export interface Repository {
   discoveryStatus?: { state: 'current' | 'stale' | 'unavailable'; checkedAt: string; lastVerifiedAt: string | null; reasons: string[] };
   git?: { availability: 'available' | 'unavailable'; head: string | null; changedFiles: number | null; untrackedFiles: number | null; reason?: string };
   instructions?: InstructionFile[];
+  /** H0-33: a read-time-only overlay Store.snapshot() merges in from NativeInventory (never persisted with
+   * the rest of this record, never present on a replayed historical state) — how many of this repository's
+   * native-backed sessions are visibility 'hidden' right now. Omitted (not zero) when there are none, so a
+   * repository with no hidden sessions keeps its exact original shape. Lets the house inspector show "N
+   * hidden · Show" immediately on load, with no separate request; clicking Show still fetches the paginated
+   * list itself. */
+  hiddenSessionCount?: number;
 }
 /** `kind` is optional so a repository record saved before WS5-02 still loads: the drawer falls back to
  * a filename-based guess when it is missing, and a later scan fills it in. */

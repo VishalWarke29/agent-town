@@ -31,8 +31,8 @@ describe('native session identity and visibility', () => {
       const record = f.store.native.page(f.store.snapshot().state).items[0]!;
       expect(record).toMatchObject({ title: 'Repair local session tracking', nativeAgentName: 'Rowan', activity: 'unknown', observedAt: null });
       expect(f.store.native.detail(record.id, f.store.snapshot().state).discovery?.title).toBe(record.title);
-      f.store.commit('custom-character-name', state => {
-        f.store.native.visibility(record.id, true, state);
+      f.store.commit('custom-character-name', (state, now) => {
+        f.store.native.visibility(record.id, true, state, now);
         state.agents[0]!.name = 'My session reviewer';
         return 'agent.renamed';
       });
@@ -61,7 +61,7 @@ describe('native session identity and visibility', () => {
       const record = f.store.native.page(f.store.snapshot().state).items[0]!;
       expect(record).toMatchObject({ activity: 'unknown', observedAt: null, visible: false });
       expect(f.store.snapshot().state.agents).toHaveLength(0);
-      f.store.commit(randomUUID(), state => { f.store.native.visibility(record.id, true, state); return 'observation.visible'; });
+      f.store.commit(randomUUID(), (state, now) => { f.store.native.visibility(record.id, true, state, now); return 'observation.visible'; });
       const before = f.store.snapshot().state.agents[0]!;
       expect(before.activity).toBe('unknown'); expect(before.observation).toBeUndefined();
       f.receive(f.event('start'));
@@ -104,7 +104,7 @@ describe('native session identity and visibility', () => {
     const f = fixture();
     try {
       f.receive(f.event('start')); const id = f.store.snapshot().state.agents[0]!.id;
-      f.store.commit(randomUUID(), state => { f.store.native.visibility(id, false, state); return 'observation.hidden'; });
+      f.store.commit(randomUUID(), (state, now) => { f.store.native.visibility(id, false, state, now); return 'observation.hidden'; });
       f.receive({ ...f.event('report', 'session-1', 'turn.end'), summary: 'A saved report from a hidden session.' });
       f.discover();
       expect(f.store.snapshot().state.agents).toHaveLength(0);
@@ -239,7 +239,7 @@ describe('native session identity and visibility', () => {
     try {
       f.receive({ ...f.event('child', 'parent'), sessionId: 'parent:child', parentSessionId: 'parent', nativeParentSessionId: 'parent', nativeChildId: 'child' });
       const id = f.store.snapshot().state.agents[0]!.id;
-      f.store.commit('hide-child', state => { f.store.native.visibility(id, false, state); return 'observation.hidden'; });
+      f.store.commit('hide-child', (state, now) => { f.store.native.visibility(id, false, state, now); return 'observation.hidden'; });
       f.receive(f.event('direct', 'child'));
       f.discover('child', 'parent');
       expect(f.store.snapshot().state.agents).toHaveLength(0);
@@ -470,7 +470,7 @@ describe('hide every watched session of a project (H0-12)', () => {
       f.receive(f.event('start-new', 'session-new'));
       expect(residentIds(f)).toEqual([sessionOf(f, 'session-new').agentId]);
       // Undo is per session: showing one brings back only that one, and a second hide-all takes it away again.
-      f.store.commit(randomUUID(), current => { f.store.native.visibility(hidden[1]!, true, current); return 'observation.visible'; });
+      f.store.commit(randomUUID(), (current, now) => { f.store.native.visibility(hidden[1]!, true, current, now); return 'observation.visible'; });
       expect(residentIds(f).sort()).toEqual([hidden[1]!, sessionOf(f, 'session-new').agentId].sort());
       expect(hideAll(f)).toEqual({ hidden: 2, alreadyHidden: 1, skippedLegacy: 0 });
       expect(f.store.snapshot().state.agents).toHaveLength(0);
@@ -482,7 +482,7 @@ describe('hide every watched session of a project (H0-12)', () => {
     try {
       f.receive(f.event('start-stray', 'session-stray'));
       const id = sessionOf(f, 'session-stray').agentId;
-      f.store.commit(randomUUID(), state => { f.store.native.visibility(id, false, state); return 'observation.hidden'; });
+      f.store.commit(randomUUID(), (state, now) => { f.store.native.visibility(id, false, state, now); return 'observation.hidden'; });
       f.store.commit(randomUUID(), state => { state.agents.push(structuredClone(f.store.native.detail(id, state))); return 'observation.legacy'; });
       expect(residentIds(f)).toEqual([id]); expect(sessionOf(f, 'session-stray')).toMatchObject({ visibility: 'hidden', sceneVisible: true });
       expect(hideAll(f)).toEqual({ hidden: 1, alreadyHidden: 0, skippedLegacy: 0 });
@@ -524,9 +524,13 @@ describe('hide every watched session of a project (H0-12)', () => {
         return seen!;
       };
       const bulk = rehearse((state, now) => { f.store.native.hideProject('repo-native', state, now); });
-      const single = rehearse(state => { for (const id of ids) f.store.native.visibility(id, false, state); });
-      expect(bulk).toEqual(single);
-      expect(bulk.agents).toHaveLength(1); expect(bulk.sessions.every(session => session.visibility === 'hidden')).toBe(true);
+      const single = rehearse((state, now) => { for (const id of ids) f.store.native.visibility(id, false, state, now); });
+      // Both strategies run in separate rehearsed commits, each with its own freshly read `now`; normalize
+      // hiddenAt to "was it stamped at all" so the comparison below cannot flake on a millisecond of clock
+      // drift between the two, while still proving both leave every session's hiddenAt equally set.
+      const normalize = (value: typeof bulk) => ({ ...value, sessions: value.sessions.map(session => ({ ...session, hiddenAt: session.hiddenAt !== null })) });
+      expect(normalize(bulk)).toEqual(normalize(single));
+      expect(bulk.agents).toHaveLength(1); expect(bulk.sessions.every(session => session.visibility === 'hidden' && session.hiddenAt !== null)).toBe(true);
     } finally { f.store.close(); }
   });
 
@@ -556,7 +560,7 @@ describe('hide every watched session of a project (H0-12)', () => {
       const other = addOtherHouse(f);
       f.receive(f.event('other-live-start', 'other-live'), other); f.receive(f.event('other-hand-start', 'other-hand'), other); f.receive(f.event('other-end', 'other-ended', 'session.end'), other);
       const handId = sessionOf(f, 'other-hand').agentId, finishedId = sessionOf(f, 'other-ended').agentId;
-      f.store.commit(randomUUID(), state => { f.store.native.visibility(handId, false, state); return 'observation.hidden'; });
+      f.store.commit(randomUUID(), (state, now) => { f.store.native.visibility(handId, false, state, now); return 'observation.hidden'; });
       const finished = f.store.snapshot().state.agents.find(agent => agent.id === finishedId)!;
       f.store.archiveAgent(finished.id, archiveReview(f.store.snapshot().state, finished).reviewToken);
       f.receive(f.event('mine-start', 'mine-1'));
@@ -582,7 +586,7 @@ describe('hide every watched session of a project (H0-12)', () => {
       // Only discovery.sourceId: found by a scan and shown by the owner; no tool event was ever seen for it.
       f.discover('scan-only');
       const scanned = sessionOf(f, 'scan-only').id;
-      f.store.commit(randomUUID(), state => { f.store.native.visibility(scanned, true, state); return 'observation.visible'; });
+      f.store.commit(randomUUID(), (state, now) => { f.store.native.visibility(scanned, true, state, now); return 'observation.visible'; });
       // Only observation.nativeSourceId: a hook session first seen before its connection had a native profile, then taken over by a bound native event.
       const legacy: ObservationConnection = { ...f.connection, nativeSourceId: undefined, sourceRevision: undefined, binding: undefined };
       f.store.commit(randomUUID(), (state, at) => applyObservation(state, legacy, { id: 'adopt-legacy-start', sessionId: 'adopted-1', kind: 'tool.start', occurredAt: at }, at));
@@ -627,11 +631,15 @@ describe('hidden total, visibility filter, and the opt-in 200-resident show refu
       f.store.commit(randomUUID(), current => { f.store.native.discover(f.source, 'repo-native', [{ nativeSessionId: 'session-old', projectPath: 'C:\\projects\\fixture', createdAt: oldAt, updatedAt: oldAt }], current, oldAt); return 'observation.discovered'; });
       const idOne = f.store.native.page(f.store.snapshot().state).items.find(item => item.nativeSessionId === 'session-1')!.id;
       const oldId = f.store.native.page(f.store.snapshot().state, { includeOlder: true }).items.find(item => item.nativeSessionId === 'session-old')!.id;
-      f.store.commit(randomUUID(), state => { f.store.native.visibility(idOne, false, state); f.store.native.visibility(oldId, false, state); return 'observation.hidden'; });
+      // H0-33: the 30-day window is keyed off when each session was HIDDEN (hiddenAt), not its own stale
+      // activity time — idOne is hidden just now (fresh hiddenAt) while oldId is hidden with an explicit
+      // 40-day-old hiddenAt, so this still proves the "old hidden session stays out of the default view"
+      // half of the story, now through the mechanism that is actually correct.
+      f.store.commit(randomUUID(), (state, now) => { f.store.native.visibility(idOne, false, state, now); f.store.native.visibility(oldId, false, state, oldAt); return 'observation.hidden'; });
 
       const state = f.store.snapshot().state;
-      // Default window: the old hidden session is outside the 30-day cutoff, so it is absent from items —
-      // but hiddenTotal still counts it, because it is never windowed.
+      // Default window: oldId's hiddenAt is outside the 30-day cutoff, so it is absent from items — but
+      // hiddenTotal still counts it, because it is never windowed.
       const unfiltered = f.store.native.page(state, { repoId: 'repo-native' });
       expect(unfiltered.hiddenTotal).toBe(2);
       expect(unfiltered.items.find(item => item.nativeSessionId === 'session-1')).toMatchObject({ visibility: 'hidden' });
@@ -663,25 +671,119 @@ describe('hidden total, visibility filter, and the opt-in 200-resident show refu
 
       // Default (every caller that omits the option, including fixtures that seed overflow state on purpose,
       // like this file's H0-12 tests and history.test.ts): silent, exactly as it always has been.
-      f.store.commit(randomUUID(), state => { f.store.native.visibility(overflow.id, true, state); return 'observation.visible'; });
+      f.store.commit(randomUUID(), (state, now) => { f.store.native.visibility(overflow.id, true, state, now); return 'observation.visible'; });
       const afterSilent = f.store.snapshot().state;
       expect(afterSilent.agents).toHaveLength(200);
       expect(afterSilent.agents.some(agent => agent.id === overflow.id)).toBe(false);
       expect(f.store.native.page(afterSilent, { includeOlder: true }).items.find(item => item.id === overflow.id)).toMatchObject({ visibility: 'shown', visible: true, sceneVisible: false });
 
       // Put it back to hidden, then prove the strict mode refuses instead of repeating that silent loss.
-      f.store.commit(randomUUID(), state => { f.store.native.visibility(overflow.id, false, state); return 'observation.hidden'; });
+      f.store.commit(randomUUID(), (state, now) => { f.store.native.visibility(overflow.id, false, state, now); return 'observation.hidden'; });
       const before = f.store.snapshot();
-      expect(() => f.store.commit(randomUUID(), state => { f.store.native.visibility(overflow.id, true, state, { onLimit: 'refuse' }); return 'observation.visible'; }))
+      expect(() => f.store.commit(randomUUID(), (state, now) => { f.store.native.visibility(overflow.id, true, state, now, { onLimit: 'refuse' }); return 'observation.visible'; }))
         .toThrowError(expect.objectContaining({ code: 'NATIVE_RESIDENT_LIMIT', statusCode: 429, message: 'Town is full at 200 residents. Hide one to show this.' }));
       // Refused cleanly: nothing was written, and the session is still hidden and findable, not lost.
       expect(f.store.snapshot()).toEqual(before);
       expect(f.store.native.page(f.store.snapshot().state, { includeOlder: true }).items.find(item => item.id === overflow.id)).toMatchObject({ visibility: 'hidden', visible: false });
 
       // Freeing a slot lets the strict mode succeed too: it only refuses AT the cap.
-      f.store.commit(randomUUID(), state => { f.store.native.visibility(state.agents[0]!.id, false, state); return 'observation.hidden'; });
-      f.store.commit(randomUUID(), state => { f.store.native.visibility(overflow.id, true, state, { onLimit: 'refuse' }); return 'observation.visible'; });
+      f.store.commit(randomUUID(), (state, now) => { f.store.native.visibility(state.agents[0]!.id, false, state, now); return 'observation.hidden'; });
+      f.store.commit(randomUUID(), (state, now) => { f.store.native.visibility(overflow.id, true, state, now, { onLimit: 'refuse' }); return 'observation.visible'; });
       expect(f.store.snapshot().state.agents.some(agent => agent.id === overflow.id)).toBe(true);
+    } finally { f.store.close(); }
+  });
+});
+
+// H0-33: a real hiddenAt timestamp (not activity time) decides "hidden in the last 30 days", and a narrow
+// hiddenCounts() overlay input lets Store.snapshot() show "N hidden · Show" with no separate request.
+describe('hiddenAt recency and the hiddenCounts overlay input (H0-33)', () => {
+  it('stamps hiddenAt on hide, clears it on show, and a bulk hideProject stamps every session it hides', () => {
+    const f = fixture();
+    try {
+      f.receive(f.event('start-1', 'session-1'));
+      const id = f.store.snapshot().state.agents[0]!.id;
+      expect(sessionOf(f, 'session-1').hiddenAt).toBeNull();
+      f.store.commit(randomUUID(), (state, now) => { f.store.native.visibility(id, false, state, now); return 'observation.hidden'; });
+      expect(sessionOf(f, 'session-1').hiddenAt).not.toBeNull();
+      f.store.commit(randomUUID(), (state, now) => { f.store.native.visibility(id, true, state, now); return 'observation.visible'; });
+      expect(sessionOf(f, 'session-1').hiddenAt).toBeNull();
+      for (const other of ['session-2', 'session-3']) f.receive(f.event(`start-${other}`, other));
+      expect(hideAll(f).hidden).toBe(3);
+      for (const nativeId of ['session-1', 'session-2', 'session-3']) expect(sessionOf(f, nativeId).hiddenAt).not.toBeNull();
+    } finally { f.store.close(); }
+  });
+
+  it('includes a session hidden today in the default view even when its own last activity is 6 months stale', () => {
+    const f = fixture();
+    try {
+      const staleAt = new Date(Date.now() - 180 * 86400000).toISOString();
+      f.store.commit(randomUUID(), current => { f.store.native.discover(f.source, 'repo-native', [{ nativeSessionId: 'stale-session', projectPath: 'C:\\projects\\fixture', createdAt: staleAt, updatedAt: staleAt }], current, staleAt); return 'observation.discovered'; });
+      const id = f.store.native.page(f.store.snapshot().state, { includeOlder: true }).items.find(item => item.nativeSessionId === 'stale-session')!.id;
+      // Hidden NOW (fresh hiddenAt), despite discoveredAt/nativeUpdatedAt both being 6 months old.
+      f.store.commit(randomUUID(), (state, now) => { f.store.native.visibility(id, false, state, now); return 'observation.hidden'; });
+      const defaultView = f.store.native.page(f.store.snapshot().state, { repoId: 'repo-native', visibility: 'hidden' });
+      expect(defaultView.items.map(item => item.nativeSessionId)).toContain('stale-session');
+    } finally { f.store.close(); }
+  });
+
+  it('treats a pre-existing hidden session with no hiddenAt as unknown, so it needs includeOlder (migration fallback)', () => {
+    const f = fixture();
+    try {
+      f.discover('legacy-hidden');
+      const before = sessionOf(f, 'legacy-hidden');
+      const state = f.store.snapshot().state;
+      const agent = f.store.native.detail(before.id, state);
+      // Simulates data an OLDER build persisted before hiddenAt existed: visibility 'hidden' with no
+      // hiddenAt key at all (not even an explicit null), reached the same way an earlier test in this file
+      // reaches the private save() method directly.
+      const legacy: Record<string, unknown> = { ...before, visibility: 'hidden', visible: false, sceneVisible: false };
+      delete legacy.hiddenAt;
+      const save = f.store.native as unknown as { save(session: NativeSession, agentValue: Agent | undefined): void };
+      f.store.commit(randomUUID(), () => { save.save(legacy as unknown as NativeSession, agent); return 'observation.fixture-legacy-hidden'; });
+      const afterState = f.store.snapshot().state;
+      expect(f.store.native.page(afterState, { repoId: 'repo-native', visibility: 'hidden' }).items.map(item => item.nativeSessionId)).not.toContain('legacy-hidden');
+      expect(f.store.native.page(afterState, { repoId: 'repo-native', visibility: 'hidden', includeOlder: true }).items.map(item => item.nativeSessionId)).toContain('legacy-hidden');
+    } finally { f.store.close(); }
+  });
+
+  it('counts 0, 1, 50 and 200 hidden sessions per repository and never leaks between two different repos', () => {
+    const f = fixture();
+    try {
+      const other = addOtherHouse(f);
+      expect(f.store.native.hiddenCounts(['repo-native', OTHER_HOUSE])).toEqual({});
+      expect(f.store.native.hiddenCounts([])).toEqual({});
+
+      f.receive(f.event('start-solo', 'solo-session'));
+      const soloId = sessionOf(f, 'solo-session').agentId;
+      f.store.commit(randomUUID(), (state, now) => { f.store.native.visibility(soloId, false, state, now); return 'observation.hidden'; });
+      expect(f.store.native.hiddenCounts(['repo-native', OTHER_HOUSE])).toEqual({ 'repo-native': 1 });
+      // Scoped to the requested repos only: asking for just one repo never reports the other's count.
+      expect(f.store.native.hiddenCounts(['repo-native'])).toEqual({ 'repo-native': 1 });
+
+      f.receive(f.event('start-other', 'other-session'), other);
+      const otherId = sessionOf(f, 'other-session').agentId;
+      f.store.commit(randomUUID(), (state, now) => { f.store.native.visibility(otherId, false, state, now); return 'observation.hidden'; });
+      expect(f.store.native.hiddenCounts(['repo-native', OTHER_HOUSE])).toEqual({ 'repo-native': 1, [OTHER_HOUSE]: 1 });
+      expect(f.store.native.hiddenCounts(['repo-native'])).toEqual({ 'repo-native': 1 });
+
+      f.store.commit(randomUUID(), (state, at) => {
+        for (let i = 0; i < 49; i++) f.store.native.receive(state, f.connection, { ...f.event(`start-bulk-${i}`, `bulk-session-${i}`), occurredAt: at }, at);
+        return 'observation.many';
+      });
+      expect(hideAll(f).hidden).toBe(49);
+      expect(f.store.native.hiddenCounts(['repo-native'])).toEqual({ 'repo-native': 50 });
+
+      f.store.commit(randomUUID(), (state, at) => {
+        for (let i = 0; i < 150; i++) f.store.native.receive(state, f.connection, { ...f.event(`start-more-${i}`, `more-session-${i}`), occurredAt: at }, at);
+        return 'observation.many';
+      });
+      expect(hideAll(f).hidden).toBe(150);
+      expect(f.store.native.hiddenCounts(['repo-native'])).toEqual({ 'repo-native': 200 });
+
+      // Store.snapshot()'s overlay reads the same counts, sparse (omitted, never zero) for a repo with none.
+      const snapshot = f.store.snapshot();
+      expect(snapshot.state.repositories.find(repo => repo.id === 'repo-native')?.hiddenSessionCount).toBe(200);
+      expect(snapshot.state.repositories.find(repo => repo.id === OTHER_HOUSE)?.hiddenSessionCount).toBe(1);
     } finally { f.store.close(); }
   });
 });

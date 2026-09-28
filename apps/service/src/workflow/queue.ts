@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { ManagerQueueStatus, TownState } from '@agent-town/contracts';
-import { billingDay, eligibleForManager, maximumRequestCost, reserveOperation, WorkflowError, workflowState } from './budget.js';
+import { billingDay, managerEligibility, maximumRequestCost, reserveOperation, WorkflowError, workflowState } from './budget.js';
 import { buildManagerInput } from './context.js';
 
 export function queueBasis(state: TownState, now: string): string {
@@ -17,8 +17,12 @@ export function queueBasis(state: TownState, now: string): string {
 export function managerQueueStatus(state: TownState, now: string): ManagerQueueStatus {
   const workflow = workflowState(state), manager = workflow.manager, config = manager.config;
   const reports = state.handoffs.filter(report => report.status === 'saved').sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+  // Computed once and attached to every returned status (MG-42): the client (ManagerQueue,
+  // ManagerPanel) can then show an accurate eligible-vs-total count and a per-report reason
+  // without a dedicated new endpoint or its own re-implementation of this selector.
+  const { eligibleIds, excluded } = managerEligibility(state);
   const make = (status: ManagerQueueStatus['state'], code: string, message: string, retryAt: string | null = null): ManagerQueueStatus => ({
-    state: status, code, message, reportIds: reports.map(report => report.id), pendingCount: reports.length, checkedAt: now, retryAt, inferenceCalls: 0, dispatchVerified: false,
+    state: status, code, message, reportIds: reports.map(report => report.id), pendingCount: reports.length, checkedAt: now, retryAt, inferenceCalls: 0, dispatchVerified: false, excluded,
   });
   if (manager.jobs.some(job => job.status === 'running')) return make('running', 'manager_running', 'A saved manager request is in progress. New reports remain queued for a later batch.');
   if (!reports.length) return make('idle', 'manager_no_reports', 'No saved reports are waiting. Opening this panel starts no model call.');
@@ -34,9 +38,23 @@ export function managerQueueStatus(state: TownState, now: string): ManagerQueueS
   const failed = new Set(manager.jobs.filter(job => job.status === 'failed').flatMap(job => job.reportIds));
   const retryable = reports.filter(report => !failed.has(report.id));
   if (!retryable.length) return make('waiting', 'manager_explicit_retry', 'Previous attempts failed. Review the saved operation and use the explicit paid action to retry; automatic retry is disabled.');
-  const eligible = retryable.filter(report => eligibleForManager(report, state));
-  if (!eligible.length) return make('waiting', 'manager_baseline_pending', 'The saved reports are older than when the manager started. They are excluded from processing until a reviewed way to include older reports exists; newer reports are unaffected.');
-  if (!state.repositories.some(repo => repo.id === eligible[0].repoId)) return make('waiting', 'report_repository_missing', 'The oldest report references an unavailable repository. Review its evidence before processing.');
+  const eligible = retryable.filter(report => eligibleIds.includes(report.id));
+  if (!eligible.length) {
+    // Every retryable report is in `excluded` (managerEligibility partitions every 'saved'
+    // report into eligibleIds or excluded, and retryable is a subset of the saved reports).
+    // Name the true reason instead of always blaming "older than baseline" (the bug this fixes):
+    // one distinct message per single reason, and an honest "more than one reason" message when
+    // the excluded reports do not all share the same one.
+    const reasons = new Set(retryable.map(report => excluded.find(item => item.id === report.id)!.reason));
+    if (reasons.size === 1) {
+      const [reason] = reasons;
+      if (reason === 'held-after-stop') return make('waiting', 'manager_held_after_stop', 'The saved reports are held after Stop watching. They stay out of both automatic and explicit processing until a held report is chosen by hand into a packet, or the connection is watched again.');
+      if (reason === 'older-than-baseline') return make('waiting', 'manager_baseline_pending', 'The saved reports are older than when the manager started. They are excluded from processing until a reviewed way to include older reports exists; newer reports are unaffected.');
+      if (reason === 'wrong-scope') return make('waiting', 'report_repository_missing', 'The saved reports reference a repository that is no longer connected. Review their evidence before processing.');
+      if (reason === 'already-processing') return make('waiting', 'manager_already_processing', 'Every saved report is already claimed by another manager operation. Wait for it to finish or reconcile its outcome.');
+    }
+    return make('waiting', 'manager_reports_excluded', 'Saved reports are excluded from processing for more than one reason. Review each report below to see why it is held.');
+  }
   try { if (buildManagerInput(state, [eligible[0]]).evidence.inputBytes > 100000) return make('waiting', 'manager_input_large', 'One report and the saved context exceed the byte bound. Review the evidence or context before processing.'); }
   catch (error) { return make('waiting', error instanceof WorkflowError ? error.code : 'manager_input_invalid', 'The saved report bundle needs review before processing.'); }
   const saved = manager.waitingStatus;

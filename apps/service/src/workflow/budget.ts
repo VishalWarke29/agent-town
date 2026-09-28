@@ -1,5 +1,5 @@
 import type { Handoff, TownState } from '@agent-town/contracts';
-import { economyPolicySchema, workflowModelSchema, type WorkflowState, type WorkflowModel, type BudgetReservation, type WorkflowUsage } from '../../../../packages/contracts/src/workflow.js';
+import { economyPolicySchema, workflowModelSchema, type WorkflowState, type WorkflowModel, type BudgetReservation, type WorkflowUsage, type ManagerExclusionReason } from '../../../../packages/contracts/src/workflow.js';
 
 export class WorkflowError extends Error {
   constructor(public readonly code: string, message: string, public readonly statusCode = 409) { super(message); this.name = 'WorkflowError'; }
@@ -116,20 +116,65 @@ export function releaseReservation(state: TownState, id: string, now: string, re
 }
 
 /**
+ * The three checks eligibleForManager has always applied ('saved' status, the manager baseline,
+ * and the Stop-watching hold), in the same order, factored out once so eligibleForManager and
+ * managerEligibility (below) can never silently drift apart: managerEligibility calls this exact
+ * function to decide the same three things, then reports which ONE excluded a report instead of
+ * a plain boolean. Nothing else should call this directly.
+ */
+function savedReportBaseExclusion(report: Handoff, state: TownState): 'not-saved' | 'older-than-baseline' | 'held-after-stop' | null {
+  if (report.status !== 'saved') return 'not-saved';
+  const baseline = workflowState(state).manager.baselineAt;
+  if (baseline && Date.parse(report.createdAt) < Date.parse(baseline)) return 'older-than-baseline';
+  // H0-13 (Stop watching): while automatic manager processing is on, the final drain saves a
+  // connection's last reports but holds them out of the automatic queue (D47's default); the
+  // owner can still pick a held report by hand into a packet. H0-24 extends this same list.
+  if (state.observation?.heldFromManagerReportIds?.includes(report.id)) return 'held-after-stop';
+  return null;
+}
+
+/**
  * Whether a saved report may ever be queued for manager processing (automatic or explicit).
  * Used by queueManagerReports and managerQueueStatus so they never disagree about what is
  * actually eligible. Project-level exclusion (a future reviewed owner selection) does not
  * exist yet, so it excludes nothing here today.
  */
 export function eligibleForManager(report: Handoff, state: TownState): boolean {
-  if (report.status !== 'saved') return false;
-  const baseline = workflowState(state).manager.baselineAt;
-  if (baseline && Date.parse(report.createdAt) < Date.parse(baseline)) return false;
-  // H0-13 (Stop watching): while automatic manager processing is on, the final drain saves a
-  // connection's last reports but holds them out of the automatic queue (D47's default); the
-  // owner can still pick a held report by hand into a packet. H0-24 extends this same list.
-  if (state.observation?.heldFromManagerReportIds?.includes(report.id)) return false;
-  return true;
+  return savedReportBaseExclusion(report, state) === null;
+}
+
+export interface ManagerEligibilityResult {
+  eligibleIds: string[];
+  excluded: { id: string; reason: ManagerExclusionReason }[];
+}
+
+/**
+ * The richer selector behind the manager's saved-report queue status and its UI (MG-42): every
+ * 'saved' report, split into what is eligible right now and what is excluded and why. Reuses
+ * eligibleForManager's own three checks (via savedReportBaseExclusion) so a 'saved' report's
+ * presence in eligibleIds can never disagree with eligibleForManager(report, state) — except for
+ * the two ADDITIVE reasons below, which eligibleForManager has never covered and must keep not
+ * covering, preserving its existing pass/fail semantics for every other caller:
+ *  - 'already-processing': claimed by a running/uncertain/processed job. The same check
+ *    queueManagerReports has always layered on top separately (heldReports, below).
+ *  - 'wrong-scope': the report's repository is no longer connected. Today only checked
+ *    separately, and inconsistently, by managerQueueStatus (the oldest "eligible" report only)
+ *    and processManager (aborts the whole dispatch attempt if any selected candidate hits it).
+ */
+export function managerEligibility(state: TownState): ManagerEligibilityResult {
+  const workflow = workflowState(state);
+  const heldReports = new Set(workflow.manager.jobs.filter(job => job.status === 'running' || job.status === 'uncertain' || job.status === 'processed').flatMap(job => job.reportIds));
+  const eligibleIds: string[] = [];
+  const excluded: { id: string; reason: ManagerExclusionReason }[] = [];
+  for (const report of state.handoffs) {
+    if (report.status !== 'saved') continue;
+    const base = savedReportBaseExclusion(report, state);
+    if (base === 'older-than-baseline' || base === 'held-after-stop') { excluded.push({ id: report.id, reason: base }); continue; }
+    if (heldReports.has(report.id)) { excluded.push({ id: report.id, reason: 'already-processing' }); continue; }
+    if (!state.repositories.some(repo => repo.id === report.repoId)) { excluded.push({ id: report.id, reason: 'wrong-scope' }); continue; }
+    eligibleIds.push(report.id);
+  }
+  return { eligibleIds, excluded };
 }
 
 export function queueManagerReports(state: TownState): void {

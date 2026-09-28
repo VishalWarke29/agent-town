@@ -123,7 +123,7 @@ export function registerNativeApi(app: FastifyInstance, scoped: (request: Fastif
     // H0-15: 'refuse' is the real user-facing entry point, so a session hitting the 200-resident limit stays
     // 'hidden' (still findable, still reversible) instead of the silent "marked shown, never placed" it left
     // every other caller of native.visibility (test fixtures included) exactly as it was.
-    return store.commit(`native-visibility:${randomUUID()}`, state => { store.native.visibility((request.params as { sessionId: string }).sessionId, parsed.data.visible, state, { onLimit: 'refuse' }); return 'observation.native_visibility'; }).snapshot;
+    return store.commit(`native-visibility:${randomUUID()}`, (state, now) => { store.native.visibility((request.params as { sessionId: string }).sessionId, parsed.data.visible, state, now, { onLimit: 'refuse' }); return 'observation.native_visibility'; }).snapshot;
   });
   // H0-12: hide every watched session of one project in ONE commit (all or nothing). The commit type must stay "observation.*" and
   // must not contain report, run, task, connection and the like: store.ts pins such receipts against the protected-history limit.

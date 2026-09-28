@@ -184,3 +184,59 @@ describe('zero-inference manager queue explanations', () => {
     expect(service.contextHistory().deliveries).toEqual([{ runId: 'run', taskId: 'task', approvedContextVersion: 0, status: 'provider-acknowledged', boundary: 'initial-request', contextBrief: 'Pinned initial approved context.', newerContextDelivery: 'unsupported' }]);
   });
 });
+
+describe('managerQueueStatus explains excluded reports honestly instead of always blaming the baseline (MG-42)', () => {
+  const pushReport = (store: Store, id: string, createdAt: string) => store.commit(`push-${id}`, state => { state.handoffs.push({ id, repoId: 'repo', agentId: 'external', summary: 'A worker report.', createdAt, status: 'saved', contextVersion: null, delivery: 'unsupported' }); return 'fixture'; });
+  const hold = (store: Store, ids: string[]) => store.commit('hold', state => { state.observation = { connections: [], ...(state.observation ?? {}), heldFromManagerReportIds: ids }; return 'fixture'; });
+
+  it('all-held: names Stop watching instead of blaming the baseline (MG-42)', () => {
+    const { store, addReport, time } = setup();
+    addReport('held-1'); addReport('held-2');
+    hold(store, ['held-1', 'held-2']);
+    const status = managerQueueStatus(store.snapshot().state, time());
+    expect(status.state).toBe('waiting'); expect(status.code).toBe('manager_held_after_stop');
+    expect(new Map(status.excluded?.map(item => [item.id, item.reason]))).toEqual(new Map([['held-1', 'held-after-stop'], ['held-2', 'held-after-stop']]));
+  });
+
+  it('all-old: keeps the existing manager_baseline_pending message and code exactly (must not regress)', () => {
+    const { store, time, advance } = setup();
+    const baseline = time();
+    store.commit('set-baseline', state => { state.workflow!.manager.baselineAt = baseline; return 'fixture'; });
+    advance(60000);
+    pushReport(store, 'old-1', new Date(Date.parse(baseline) - 60000).toISOString());
+    pushReport(store, 'old-2', new Date(Date.parse(baseline) - 30000).toISOString());
+    const status = managerQueueStatus(store.snapshot().state, time());
+    expect(status.state).toBe('waiting'); expect(status.code).toBe('manager_baseline_pending');
+    expect(status.message).toBe('The saved reports are older than when the manager started. They are excluded from processing until a reviewed way to include older reports exists; newer reports are unaffected.');
+    expect(new Map(status.excluded?.map(item => [item.id, item.reason]))).toEqual(new Map([['old-1', 'older-than-baseline'], ['old-2', 'older-than-baseline']]));
+  });
+
+  it('mixed held-and-old: names both reasons instead of picking one and hiding the other (MG-42)', () => {
+    const { store, time, advance } = setup();
+    const baseline = time();
+    store.commit('set-baseline', state => { state.workflow!.manager.baselineAt = baseline; return 'fixture'; });
+    advance(60000);
+    pushReport(store, 'old-1', new Date(Date.parse(baseline) - 60000).toISOString()); // before the baseline: excluded by age alone
+    pushReport(store, 'held-1', time()); // created after the baseline: excluded by the hold alone
+    hold(store, ['held-1']);
+    const status = managerQueueStatus(store.snapshot().state, time());
+    expect(status.state).toBe('waiting'); expect(status.code).toBe('manager_reports_excluded');
+    expect(status.message).toContain('more than one reason');
+    expect(new Map(status.excluded?.map(item => [item.id, item.reason]))).toEqual(new Map([['old-1', 'older-than-baseline'], ['held-1', 'held-after-stop']]));
+  });
+
+  it('processManager makes no reservation, starts no job and calls no provider when every saved report is held or too old, and the persisted status keeps the real reason instead of the generic dispatch error (MG-42)', async () => {
+    const { store, service, provider, time, advance } = setup();
+    const baseline = time();
+    store.commit('set-baseline', state => { state.workflow!.manager.baselineAt = baseline; return 'fixture'; });
+    advance(60000);
+    pushReport(store, 'old-1', new Date(Date.parse(baseline) - 60000).toISOString());
+    pushReport(store, 'held-1', time());
+    hold(store, ['held-1']);
+    await expect(service.processManager('attempt')).rejects.toMatchObject({ code: 'manager_no_reports' });
+    expect(store.snapshot().state.workflow!.reservations).toEqual([]);
+    expect(store.snapshot().state.workflow!.manager.jobs).toEqual([]);
+    expect(provider.countInput).not.toHaveBeenCalled(); expect(provider.summarize).not.toHaveBeenCalled();
+    expect(store.snapshot().state.workflow!.manager.waitingStatus?.code).toBe('manager_reports_excluded');
+  });
+});

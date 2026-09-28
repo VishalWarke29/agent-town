@@ -4,7 +4,13 @@ import type { IdentityController } from './useIdentity';
 import { manualContext } from './manual-context';
 
 type ContextHistory = { versions: ContextVersion[]; deliveries: { runId: string; taskId: string; approvedContextVersion: number; status: string; boundary: 'initial-request'; contextBrief: string | null; newerContextDelivery: 'unsupported' }[] };
-export function ManagerQueue({ state, identity }: { state: TownState; identity: IdentityController }) {
+
+/**
+ * The manager/status poll, lifted out of ManagerQueue (MG-42) so ManagerPanel can fetch it once
+ * and reuse the same result for the "why reports are waiting" note, the eligible-vs-total count,
+ * and each report card's excluded reason — instead of a second, independent fetch.
+ */
+export function useManagerQueueStatus(state: TownState, identity: IdentityController): { status: ManagerQueueStatus | null; error: boolean } {
   const [status, setStatus] = useState<ManagerQueueStatus | null>(null), [error, setError] = useState(false);
   const revision = JSON.stringify([state.handoffs, state.manager.version, state.workflow?.manager, state.workflow?.policy, state.workflow?.connections, state.workflow?.reservations]);
   useEffect(() => {
@@ -17,6 +23,10 @@ export function ManagerQueue({ state, identity }: { state: TownState; identity: 
     const timer = setInterval(refresh, 30000);
     return () => { stopped = true; clearInterval(timer); };
   }, [identity.read, state.workspace.id, revision]);
+  return { status, error };
+}
+
+export function ManagerQueue({ status, error }: { status: ManagerQueueStatus | null; error: boolean }) {
   return <div className="note"><div><strong>Why reports are waiting</strong><p role="status">{error ? 'Queue status is unavailable. Saved reports remain separate from processing; dispatch still checks all limits.' : status?.message ?? 'Checking saved queue conditions…'}</p>{!error && status?.state === 'waiting' && (status.retryAt ? <p className="muted small">Next automatic window: {new Date(status.retryAt).toLocaleString()}</p> : <p className="muted small">Waiting for a change. Press Process to retry.</p>)}<small>These checks use no model inference.</small></div></div>;
 }
 

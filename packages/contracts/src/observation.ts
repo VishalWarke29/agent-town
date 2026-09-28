@@ -148,6 +148,12 @@ export interface NativeSession {
   parentNativeSessionId?: string; repoId: string; createdAt: string | null; nativeUpdatedAt: string | null;
   discoveredAt: string; observedAt: string | null; visible: boolean; sceneVisible: boolean;
   visibility?: 'auto' | 'shown' | 'hidden';
+  /** H0-33: when this session most recently became visibility 'hidden' — cleared back to null when shown
+   * again. This, not activity time (observedAt/nativeUpdatedAt/discoveredAt), is the correct basis for "hidden
+   * in the last 30 days": a session with 6-month-stale activity that is hidden today must still count as
+   * recently hidden. null on a session an OLDER build hid before this field existed (a real "unknown", not
+   * "never hidden" — visibility can still read 'hidden') and, always, on one that is not currently hidden. */
+  hiddenAt: string | null;
   activity: import('./index.js').AgentActivity;
 }
 export interface NativeSessionPage { items: NativeSession[]; total: number; nextCursor: string | null;

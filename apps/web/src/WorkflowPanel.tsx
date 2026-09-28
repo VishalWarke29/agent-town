@@ -1,13 +1,25 @@
 import { CoordinationPanel } from './CoordinationPanel';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { BookOpen, Check, KeyRound, Leaf, LoaderCircle, ShieldCheck, Unplug } from 'lucide-react';
-import { apiConnectionSchema, economyPolicySchema, getModelProfile, managerConfigSchema, profilePrice, reconcileUsageSchema, type EconomyPolicy, type Handoff, type ManagerConfig, type ManagerProposal, type TownState, type WorkflowModel, type WorkflowState } from '@agent-town/contracts';
+import { apiConnectionSchema, economyPolicySchema, getModelProfile, managerConfigSchema, profilePrice, reconcileUsageSchema, type EconomyPolicy, type Handoff, type ManagerConfig, type ManagerExclusionReason, type ManagerProposal, type TownState, type WorkflowModel, type WorkflowState } from '@agent-town/contracts';
 import type { IdentityController } from './useIdentity';
 import { managerStatusLine } from './firstRunCopy';
 import { WorkflowSummary } from './WorkflowSummary';
 import { dollarsToMicroUsd, editMoney, money } from './money';
 import { SubscriptionConnections } from './RunnerPanel';
-import { ManagerQueue, MemoryPanel, ReportEvidence } from './MemoryPanel';
+import { ManagerQueue, MemoryPanel, ReportEvidence, useManagerQueueStatus } from './MemoryPanel';
+
+/** Plain, owner-facing wording for each reason managerEligibility (MG-42) can exclude a saved
+ * report from processing right now. 'unavailable' is reserved for a future exclusion category
+ * that no code path produces yet; it falls back to the same generic wording as an unknown value. */
+const EXCLUSION_LABELS: Record<ManagerExclusionReason, string> = {
+  'held-after-stop': 'Saved · held after Stop watching, not sent',
+  'older-than-baseline': 'Saved · older than the manager start, not sent',
+  'wrong-scope': 'Saved · repository no longer connected, not sent',
+  'already-processing': 'Saved · already claimed by another manager operation',
+  unavailable: 'Saved · excluded from processing, not sent',
+};
+function exclusionLabel(reason: ManagerExclusionReason): string { return EXCLUSION_LABELS[reason] ?? 'Saved · excluded from processing, not sent'; }
 
 function useOperation() {
   const [busy, setBusy] = useState(false);
@@ -120,21 +132,29 @@ export function ManagerPanel({ state, identity, available, onPrepareTask }: { st
   const acknowledgedVersions = [...new Set(acknowledgedRuns.map(run => run.contextVersion))].sort((a, b) => a - b);
   const pending = state.handoffs.filter(report => report.status === 'saved');
   const locked = workflow.manager.jobs.some(job => job.status === 'running' || job.status === 'uncertain');
+  const { status: queueStatus, error: queueStatusError } = useManagerQueueStatus(state, identity);
+  // The saved report count is always known locally; whether each one is actually eligible needs
+  // the server's managerEligibility breakdown (MG-42). When that has not loaded yet or failed,
+  // fall back to the previous, more permissive gate (a saved report exists) rather than guessing
+  // a false zero — the server-side dispatch re-verifies eligibility independently either way.
+  const excludedReasons = new Map((queueStatus?.excluded ?? []).map(item => [item.id, item.reason] as const));
+  const eligibleCount = queueStatus ? pending.filter(report => !excludedReasons.has(report.id)).length : null;
+  const disabledForEligibility = eligibleCount === null ? !pending.length : eligibleCount === 0;
   return <>
     <div className="manager-hero"><span><BookOpen size={28} /></span><div><h3>Keep the shared brief current.</h3><p>Saved reports, processing, and delivery stay separate.</p></div></div>
     <div className="brief-card"><div className="section-summary"><p className="eyebrow">SHARED BRIEF</p><span className="version">v{state.manager.version}</span></div><p className="brief-text">{state.manager.brief}</p></div>
     <Feedback operation={operation} /><Feedback operation={pause} />
-    <ManagerQueue state={state} identity={identity} />
-    <dl className="facts"><div><dt>Manager scheduling</dt><dd>{managerStatusLine(workflow.manager.config)}</dd></div><div><dt>Saved reports waiting</dt><dd>{pending.length}</dd></div><div><dt>Per-request limit</dt><dd>{money(workflow.manager.config.requestBudgetMicroUsd)}</dd></div><div><dt>Approved context delivery</dt><dd>{acknowledgedRuns.length ? `${acknowledgedRuns.length} managed run${acknowledgedRuns.length === 1 ? "" : "s"} acknowledged · ${acknowledgedVersions.map(version => `v${version}`).join(", ")}` : "No acknowledged managed deliveries"}</dd></div></dl>
-    <button className="button primary" disabled={!available || operation.busy || !workflow.policy.paidEnabled || !workflow.manager.config.enabled || locked || !pending.length} onClick={() => void operation.run(async () => { await identity.request(`/workspaces/${encodeURIComponent(state.workspace.id)}/manager/process`, {}, AbortSignal.timeout(90000)); return 'Manager request finished. Review its saved result and usage below.'; })}><BookOpen size={16} />Process saved reports · paid</button>
+    <ManagerQueue status={queueStatus} error={queueStatusError} />
+    <dl className="facts"><div><dt>Manager scheduling</dt><dd>{managerStatusLine(workflow.manager.config)}</dd></div><div><dt>Saved reports waiting</dt><dd>{eligibleCount === null ? `${pending.length} saved · eligibility unavailable` : `${eligibleCount} of ${pending.length} eligible now`}</dd></div><div><dt>Per-request limit</dt><dd>{money(workflow.manager.config.requestBudgetMicroUsd)}</dd></div><div><dt>Approved context delivery</dt><dd>{acknowledgedRuns.length ? `${acknowledgedRuns.length} managed run${acknowledgedRuns.length === 1 ? "" : "s"} acknowledged · ${acknowledgedVersions.map(version => `v${version}`).join(", ")}` : "No acknowledged managed deliveries"}</dd></div></dl>
+    <button className="button primary" disabled={!available || operation.busy || !workflow.policy.paidEnabled || !workflow.manager.config.enabled || locked || disabledForEligibility} onClick={() => void operation.run(async () => { await identity.request(`/workspaces/${encodeURIComponent(state.workspace.id)}/manager/process`, {}, AbortSignal.timeout(90000)); return 'Manager request finished. Review its saved result and usage below.'; })}><BookOpen size={16} />Process saved reports · paid</button>
     {workflow.manager.config.enabled && <button className="button stop-manager" disabled={!available || pause.busy} onClick={() => void pause.run(async () => { await identity.request(`/workspaces/${encodeURIComponent(state.workspace.id)}/manager/config`, { ...workflow.manager.config, enabled: false }, undefined, 'PATCH'); return 'Future manager summaries are disabled. An already-sent request may still finish.'; })}>Disable future manager summaries</button>}
     <p className="muted small">New tasks capture a context version for approval. Existing runs keep their approved context; processing a report does not send them the newer brief.</p>
     <Info>Processing uses the saved account, model, and request limit. Economy groups automatic reports for 30 seconds and starts at most six automatic batches per rolling hour.</Info>
     <ManagerSettings key={JSON.stringify(workflow.manager.config)} state={state} identity={identity} available={available && !locked} />
     <h3 className="subheading">Reports at the desk</h3>
     {state.handoffs.length === 0 && <p className="empty">No reports have been received. A tool ending its response does not create a success report.</p>}
-    {state.handoffs.map(report => { const olderThanBaseline = report.status === 'saved' && !!workflow.manager.baselineAt && report.createdAt < workflow.manager.baselineAt;
-      return <article className="handoff-card" key={report.id}><div className="section-summary"><strong>{reportAgentName(state, report)}</strong><time dateTime={report.createdAt}>{new Date(report.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div><p>{report.summary}</p><div className="handoff-status">{report.status === 'processed' ? <><Check size={14} />Manager processed v{report.contextVersion}</> : olderThanBaseline ? 'Saved · older than the manager start, not sent' : 'Saved · manager pending'}</div><ReportContext state={state} report={report} /><ReportEvidence report={report} /></article>; })}
+    {state.handoffs.map(report => { const exclusionReason = report.status === 'saved' ? excludedReasons.get(report.id) : undefined;
+      return <article className="handoff-card" key={report.id}><div className="section-summary"><strong>{reportAgentName(state, report)}</strong><time dateTime={report.createdAt}>{new Date(report.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div><p>{report.summary}</p><div className="handoff-status">{report.status === 'processed' ? <><Check size={14} />Manager processed v{report.contextVersion}</> : exclusionReason ? exclusionLabel(exclusionReason) : 'Saved · manager pending'}</div><ReportContext state={state} report={report} /><ReportEvidence report={report} /></article>; })}
     {workflow.manager.jobs.length > 0 && <><h3 className="subheading">Processing history</h3>{[...workflow.manager.jobs].reverse().map(job => <article className="observation-card" key={job.id}><strong>{job.status === 'processed' ? 'Brief updated' : job.status === 'running' ? 'Processing reports' : job.status === 'uncertain' ? 'Outcome uncertain · reconcile usage' : 'Processing failed · previous brief kept'}</strong><p>{job.model} · {job.reportIds.length} reports</p>{job.contextEvidence && <p className="muted small">{job.contextEvidence.inputTokens.toLocaleString()} input tokens · {job.contextEvidence.summaryBodyCount} summary bodies · {job.contextEvidence.reusedSummaryCount} repeated bodies reused · {job.contextEvidence.omittedRepoBriefCount} unrelated repository briefs omitted. Savings in dollars are not measured.</p>}{job.message && <p>{job.message}</p>}</article>)}</>}
     <CoordinationPanel state={state} identity={identity} />
     <MemoryPanel key={state.workspace.id} state={state} identity={identity} available={available} />

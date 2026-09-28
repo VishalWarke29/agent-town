@@ -152,3 +152,66 @@ test('scans, blocks a real secret, backs up the safe files, and restores byte-id
     expect(town.pageErrors).toEqual([]);
   } finally { await town.stop(); }
 });
+
+test('PV-03: the workspace-level restore entry backs up, then restores with the original project fully disconnected and zero projects connected, offering an explicit Connect this folder afterward', async ({ page }, testInfo) => {
+  const town = await realTown(page);
+  try {
+    await page.goto('/');
+    await expect(page.getByText('Local service connected', { exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Connect a project', exact: true }).click();
+    const local = page.getByRole('region', { name: 'Local folders', exact: true });
+    await local.getByLabel('Project folder', { exact: true }).fill(town.projectPath);
+    await local.getByRole('button', { name: 'Add this project', exact: true }).click();
+    const use = local.getByRole('button', { name: `Use ${town.projectPath} as a local project`, exact: true });
+    await expect(use).toBeEnabled();
+    await use.click();
+    await expect(page.getByRole('dialog', { name: 'Vault fixture project', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Close details', exact: true }).click();
+    await page.getByRole('button', { name: 'Open repositories', exact: true }).click();
+
+    const vaultSection = page.getByRole('region', { name: 'Project Vault', exact: true });
+    await vaultSection.getByRole('button', { name: /Project Vault/ }).click();
+    await vaultSection.getByLabel('Local backup folder', { exact: true }).fill(town.vaultDirectory);
+    await vaultSection.getByRole('button', { name: 'Turn on Project Vault', exact: true }).click();
+    await expect(vaultSection.getByText(/Project Vault is on/)).toBeVisible();
+    await vaultSection.getByRole('button', { name: 'Scan project files', exact: true }).click();
+    await expect(vaultSection.getByText('app.js', { exact: true })).toBeVisible();
+    await vaultSection.getByLabel(/Passphrase \(kept only on this request/).fill('a genuinely strong test passphrase');
+    await vaultSection.getByRole('button', { name: /Back up \d+ selected files?/ }).click();
+    await expect(vaultSection.getByText(/Backup complete: 2 files/)).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath('vault-workspace-backup.png') });
+
+    // Fully disconnect the original project (removing its allowed root cascades to disconnecting the
+    // repository too) — PV-03's "disconnected original project" and "empty workspace entry" cases both
+    // need this: the workspace-level restore below must still find and restore this backup with zero
+    // projects connected, decoupled from any currently-open project's own id.
+    await page.getByRole('button', { name: `Review removal of ${town.projectPath}`, exact: true }).click();
+    await page.getByRole('button', { name: 'Remove allowed folder', exact: true }).click();
+    await expect(page.getByText('Folder removed from discovery', { exact: false })).toBeVisible();
+
+    const restoreEntry = vaultSection.getByRole('region', { name: 'Restore a project from Vault', exact: true });
+    await expect(restoreEntry).toBeVisible();
+    await restoreEntry.getByRole('button', { name: 'Restore a project from Vault', exact: true }).click();
+    await expect(restoreEntry.getByRole('radio', { name: /Vault fixture project/ })).toBeVisible();
+    await restoreEntry.getByRole('radio', { name: /Vault fixture project/ }).check();
+    await restoreEntry.getByLabel('Restore into this folder', { exact: true }).fill(town.restoreDirectory);
+    await restoreEntry.getByLabel('Passphrase', { exact: true }).fill('a genuinely strong test passphrase');
+    await restoreEntry.getByRole('button', { name: 'Preview this backup', exact: true }).click();
+    await expect(restoreEntry.getByText(/Vault fixture project: 2 files/)).toBeVisible();
+    await restoreEntry.getByRole('button', { name: /Restore \d+ files here/ }).click();
+    await expect(restoreEntry.getByText(/Restored 2 files/)).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath('vault-workspace-restored.png') });
+
+    // Explicit, separate action — never automatic.
+    const connectButton = restoreEntry.getByRole('button', { name: 'Connect this folder', exact: true });
+    await expect(connectButton).toBeVisible();
+    await connectButton.click();
+    // The connected project is named after the restore DESTINATION folder's own basename ("restore-target"),
+    // exactly like any other local-folder connection — not after the original backup's label ("Vault fixture
+    // project"), which is a different folder path entirely (town.projectPath vs town.restoreDirectory).
+    await expect(page.getByText(/Connected restore-target as a project/)).toBeVisible({ timeout: 15000 });
+
+    expect(readFileSync(join(town.restoreDirectory, 'app.js'), 'utf8')).toBe('console.log("hello from the vault fixture");\n');
+    expect(town.pageErrors).toEqual([]);
+  } finally { await town.stop(); }
+});

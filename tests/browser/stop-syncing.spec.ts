@@ -492,7 +492,7 @@ function hiddenNativeSession(index: number, at: string): { session: NativeSessio
   const id = `hidden-fixture-${index}`;
   const agent: Agent = { id, name: `Fixture session ${index}`, provider: 'Codex', role: 'Observed session', repoId: 'project', task: 'Task not linked', activity: 'working', color: '#6c8c91', home: [-5 + index, -0.5], updatedAt: at, files: [], evidence: 'Observed tool event', contextVersion: null,
     observation: { connectionId: 'fixture-connection', sessionId: `wire-${index}`, parentSessionId: null, nativeSourceId: 'fixture-source', lastSequence: 1, sourceTime: at, freshness: 'current', billing: 'unavailable' } };
-  const session: NativeSession = { id, agentId: id, sourceId: 'fixture-source', provider: 'codex', nativeSessionId: `native-${index}`, title: `Fixture session ${index}`, repoId: 'project', createdAt: at, nativeUpdatedAt: at, discoveredAt: at, observedAt: at, visible: true, sceneVisible: true, visibility: 'shown', activity: 'working' };
+  const session: NativeSession = { id, agentId: id, sourceId: 'fixture-source', provider: 'codex', nativeSessionId: `native-${index}`, title: `Fixture session ${index}`, repoId: 'project', createdAt: at, nativeUpdatedAt: at, discoveredAt: at, observedAt: at, visible: true, sceneVisible: true, visibility: 'shown', hiddenAt: null, activity: 'working' };
   return { session, agent };
 }
 

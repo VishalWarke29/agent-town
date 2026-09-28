@@ -6,6 +6,7 @@ import { folderWindowText, reasonText } from './reasonText';
 import { useFolderBrowse } from './useFolderBrowse';
 import { connectedProjectNotice } from './houseCopy';
 import { VaultPanel } from './VaultPanel';
+import { VaultRestoreEntry } from './VaultRestoreEntry';
 
 const timeText = (value: string) => new Date(value).toLocaleString();
 
@@ -38,8 +39,10 @@ export function RepositoriesPanel({ state, request, available, onConnected }: { 
     setChosen(current => [...new Set([...current.filter(id => !removed.has(id)), ...added])]);
   }, [selectedKey]);
   const prefix = `/workspaces/${encodeURIComponent(state.workspace.id)}`;
+  // PV-03: a workspace-level restore entry (below) must be reachable with zero connected local
+  // projects, so this status read can no longer be gated on having one — it is a cheap read of
+  // Agent Town's own saved Vault setting, not a scan of anything external.
   useEffect(() => {
-    if (!state.repositories.some(repo => repo.localPath)) return;
     let disposed = false;
     void request<VaultStatus>(`${prefix}/vault`, undefined, undefined, 'GET').then(result => { if (!disposed && mounted.current) setVaultStatus(result); }).catch(() => {});
     return () => { disposed = true; };
@@ -178,10 +181,12 @@ export function RepositoriesPanel({ state, request, available, onConnected }: { 
       {unverifiedChoices && <p className="form-error" role="alert">An unsaved choice is now stale. Refresh it or clear its checkbox before saving.</p>}
       <button className="button primary" disabled={!!blocked || chosen.length > 100 || !!pendingIds.length || unverifiedChoices}><Check size={16} />Save repository selection</button>
     </form>}
-    {state.repositories.some(repo => repo.localPath) && <section aria-label="Project Vault" className="repository-vault">
+    <section aria-label="Project Vault" className="repository-vault">
       <h3 className="subheading">Project Vault</h3>
       <p className="muted small">Back up a connected project&rsquo;s own files &mdash; including ones a plain <code>git clone</code> would never bring back &mdash; to a local folder you choose, encrypted with your own passphrase. Local folder only today; no cloud account is connected yet.</p>
+      {/* PV-03: restore is reachable here regardless of whether any project is connected yet. */}
+      <VaultRestoreEntry state={state} request={request} available={available} sharedStatus={vaultStatus} onStatusChange={setVaultStatus} onConnected={onConnected} />
       {state.repositories.filter(repo => repo.localPath).map(repo => <VaultPanel key={repo.id} state={state} request={request} repoId={repo.id} repoName={repo.name} sharedStatus={vaultStatus} onStatusChange={setVaultStatus} />)}
-    </section>}
+    </section>
   </section>;
 }

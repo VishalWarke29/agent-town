@@ -106,11 +106,20 @@ export const memoryActionSchema = z.discriminatedUnion('action', [
   z.object({ action: z.enum(['resolve-blocker', 'reopen-blocker', 'supersede-decision']), expectedVersion: z.number().int().nonnegative(), recordId: id, reason: z.string().trim().min(1).max(500) }).strict(),
 ]);
 export type MemoryAction = z.infer<typeof memoryActionSchema>;
+/**
+ * Why a saved report is not currently eligible for manager processing (MG-42). 'unavailable' is
+ * reserved for a future reviewed exclusion category (e.g. a per-project selection) that does not
+ * exist yet; no code path produces it today.
+ */
+export type ManagerExclusionReason = 'held-after-stop' | 'older-than-baseline' | 'already-processing' | 'wrong-scope' | 'unavailable';
 export interface ManagerQueueStatus {
   state: 'idle' | 'waiting' | 'ready' | 'running'; code: string; message: string;
   reportIds: string[]; pendingCount: number; checkedAt: string; retryAt: string | null;
   inferenceCalls: 0; dispatchVerified: false;
   basisHash?: string;
+  /** The exclusion breakdown for every currently-saved report referenced by reportIds that is
+   * not eligible right now. Absent only on a status saved before this field existed. */
+  excluded?: { id: string; reason: ManagerExclusionReason }[];
 }
 export interface ManagerProposal {
   id: string; sourceJobId: string; repoId: string; title: string; acceptanceCriteria: string[];

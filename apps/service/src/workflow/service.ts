@@ -380,27 +380,36 @@ export class WorkflowService {
         if (pending.length) {
           const status = managerQueueStatus(state, this.time());
           const code = error instanceof WorkflowError ? error.code : 'manager_dispatch_failed';
-          const providerStatus = error instanceof ProviderRequestError ? error.providerStatus : undefined;
-          const waitable = isManagerWaitCode(code);
-          const transient = waitable && isTransientManagerWaitCode(code, providerStatus);
-          const currentBasis = queueBasis(state, this.time());
-          let retryAt: string | null = null;
-          if (transient) {
-            const now = this.now();
-            const active = this.transientBackoff?.code === code && this.transientBackoff.basisHash === currentBasis;
-            if (active && now < this.transientBackoff!.retryAtMs) retryAt = new Date(this.transientBackoff!.retryAtMs).toISOString();
-            else {
-              const ms = active ? Math.min(this.transientBackoff!.ms * 2, MANAGER_TRANSIENT_BACKOFF_MAX_MS) : MANAGER_TRANSIENT_BACKOFF_START_MS;
-              const retryAtMs = now + ms;
-              this.transientBackoff = { code, basisHash: currentBasis, retryAtMs, ms };
-              retryAt = new Date(retryAtMs).toISOString();
-            }
-          } else if (waitable) this.transientBackoff = null;
-          this.persistQueueStatus({ ...status, state: 'waiting', code,
-            message: error instanceof WorkflowError ? error.message : 'The pre-dispatch check failed. No inference was started; review the connection before retrying.',
-            basisHash: waitable ? currentBasis : undefined,
-            retryAt: waitable ? retryAt : status.retryAt,
-          });
+          // manager_no_reports here only ever means queueManagerReports found no candidates,
+          // i.e. nothing was actually eligible (MG-42). The fresh status just recomputed above
+          // already names the real reason (held-after-stop, older-than-baseline, wrong-scope, a
+          // mix, or explicit-retry); save it as-is instead of overwriting it with this generic
+          // error, which an automatic attempt would otherwise do on every tick nothing is
+          // eligible, flapping the persisted reason between the two on alternating polls.
+          if (code === 'manager_no_reports') { this.persistQueueStatus(status); }
+          else {
+            const providerStatus = error instanceof ProviderRequestError ? error.providerStatus : undefined;
+            const waitable = isManagerWaitCode(code);
+            const transient = waitable && isTransientManagerWaitCode(code, providerStatus);
+            const currentBasis = queueBasis(state, this.time());
+            let retryAt: string | null = null;
+            if (transient) {
+              const now = this.now();
+              const active = this.transientBackoff?.code === code && this.transientBackoff.basisHash === currentBasis;
+              if (active && now < this.transientBackoff!.retryAtMs) retryAt = new Date(this.transientBackoff!.retryAtMs).toISOString();
+              else {
+                const ms = active ? Math.min(this.transientBackoff!.ms * 2, MANAGER_TRANSIENT_BACKOFF_MAX_MS) : MANAGER_TRANSIENT_BACKOFF_START_MS;
+                const retryAtMs = now + ms;
+                this.transientBackoff = { code, basisHash: currentBasis, retryAtMs, ms };
+                retryAt = new Date(retryAtMs).toISOString();
+              }
+            } else if (waitable) this.transientBackoff = null;
+            this.persistQueueStatus({ ...status, state: 'waiting', code,
+              message: error instanceof WorkflowError ? error.message : 'The pre-dispatch check failed. No inference was started; review the connection before retrying.',
+              basisHash: waitable ? currentBasis : undefined,
+              retryAt: waitable ? retryAt : status.retryAt,
+            });
+          }
         }
       }
       if (error instanceof WorkflowError) throw error;

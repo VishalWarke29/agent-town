@@ -59,8 +59,8 @@ describe('durable session history', () => {
       store.native.discover(source, connection.repoId, Array.from({ length: visibility === 'overflow' ? 201 : 1 }, (_, index) => ({ nativeSessionId: `native-${index}`, projectPath: state.repositories[0]!.localPath!, createdAt: now, updatedAt: now })), state, now);
       const sessions = Array.from({ length: visibility === 'overflow' ? 9 : 1 }, (_, page) => store.native.page(state, { cursor: String(page * 25) }).items).flat();
       id = sessions.at(-1)!.agentId;
-      if (visibility === 'overflow') for (const session of sessions) store.native.visibility(session.id, true, state);
-      else store.native.visibility(id, false, state);
+      if (visibility === 'overflow') for (const session of sessions) store.native.visibility(session.id, true, state, now);
+      else store.native.visibility(id, false, state, now);
       state.handoffs.push({ id: 'native-saved-report', agentId: id, repoId: connection.repoId, createdAt: now, summary: 'Retained native evidence', status: 'saved', contextVersion: null, delivery: 'unsupported' });
       return 'handoff.saved';
     });

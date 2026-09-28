@@ -131,7 +131,23 @@ export class Store {
 
   snapshot(): Snapshot {
     const row = this.currentRow();
-    return { cursor: row.cursor, state: JSON.parse(row.data) as TownState };
+    return { cursor: row.cursor, state: this.withHiddenCounts(JSON.parse(row.data) as TownState) };
+  }
+
+  /** H0-33: a read-time-only overlay of each repository's current hidden native-session count (see
+   * NativeInventory.hiddenCounts), merged onto the parsed state so the house inspector's "N hidden · Show"
+   * badge is known the instant a snapshot loads, with zero separate requests. Deliberately never touches the
+   * persisted `data` column: commit() builds `before`/`savedState` (and the patch/event derived from them)
+   * straight from `JSON.parse(row.data)`, never through this method, so the overlay can never leak into a
+   * saved patch or become "real" persisted data. Sparse by construction (native.hiddenCounts only returns
+   * entries for repositories with at least one hidden session), so a repository with none keeps its exact
+   * original shape — this cannot introduce a new key into an existing deep-equality assertion on a
+   * `Repository` object that predates hidden inventory. */
+  private withHiddenCounts(state: TownState): TownState {
+    if (!state.repositories.length) return state;
+    const counts = this.native.hiddenCounts(state.repositories.map(repo => repo.id));
+    if (!Object.keys(counts).length) return state;
+    return { ...state, repositories: state.repositories.map(repo => counts[repo.id] ? { ...repo, hiddenSessionCount: counts[repo.id] } : repo) };
   }
 
   archiveAgent(id: string, reviewToken: string) {
@@ -248,7 +264,13 @@ export class Store {
         .run(sourceId, fingerprintHash, saved.cursor, now, pinned(type) ? 1 : 0);
       this.sqlite.prepare('UPDATE town_state SET cursor=?,data=? WHERE id=?').run(saved.cursor, data, this.workspaceId);
       this.pruneHistory(); this.pruneReceipts(now);
-      committed = { cursor: saved.cursor, state: savedState, type, occurredAt: now };
+      // H0-33: subscribers (the live SSE push) get the same hidden-count overlay a fresh GET /snapshot would
+      // return. Without this, `useTown.ts`'s `accept()` — which fully replaces its local state from whichever
+      // arrives last, the POST response or the SSE event for that same cursor — would let the very next
+      // commit ANYWHERE in the app silently erase an already-shown "N hidden · Show" badge, since committed
+      // events were otherwise built straight from the raw, un-overlaid savedState. Cheap for the same reason
+      // snapshot() is: bounded repositories, one indexed-column query, skipped entirely when there are none.
+      committed = { cursor: saved.cursor, state: this.withHiddenCounts(savedState), type, occurredAt: now };
       return false;
     })();
     // Publish only after the state and its event are durable together.
@@ -258,6 +280,15 @@ export class Store {
     return { duplicate, snapshot: this.snapshot() };
   }
 
+  /** H0-33: deliberately does NOT apply withHiddenCounts to the historical states it reconstructs, unlike
+   * snapshot() and commit()'s own live-push `committed.state` (both of which do carry it). That overlay
+   * answers "how many sessions are hidden right now"; a replayed state reconstructs a PAST cursor, and "hidden
+   * right now" is not meaningful data about that earlier moment (nor is it cheap to make historically accurate
+   * — native_sessions holds no history of its own). Its only consumer is the /events SSE route's gap catch-up
+   * (a client reconnecting behind the server's current cursor), and only while genuinely behind: the common
+   * case (no gap) never calls this at all, and once caught up the route falls through to the same live
+   * `store.subscribe` push that does carry the overlay. So the badge can only ever be transiently absent
+   * during an actual reconnect gap, never permanently — it self-heals on the very next real commit. */
   replay(after: number, limit = 200): StateEvent[] {
     if (!this.canReplay(after)) throw new ReplayUnavailableError();
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('Invalid replay limit.');

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { Snapshot } from '@agent-town/contracts';
 import { Store } from '../../apps/service/src/store';
 import { applyDemoCommand, initialState } from '../../apps/service/src/demo';
 import { privateState } from '../../apps/service/src/workspaces';
@@ -199,5 +200,49 @@ describe('durable sample state', () => {
     expect(state.handoffs[0]!.delivery).toBe('unsupported');
     expect(state.agents[0]!.contextVersion).toBeNull();
     expect(state.agents[0]!.activity).toBe('review');
+  });
+});
+
+describe('hidden-session-count overlay (H0-33)', () => {
+  it('overlays hiddenSessionCount at read time in snapshot() and the live commit push, omits it from replay(), and never persists it', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'agent-town-test-')); directories.push(directory);
+    const path = join(directory, 'town.sqlite');
+    const state = privateState({ id: 'workspace-hidden-overlay', name: 'Hidden overlay fixture', kind: 'personal' });
+    state.repositories = [{ id: 'repo-one', name: 'Project', description: '', language: '', branch: 'Unavailable', color: '#859b87', position: [0, 0], source: 'local', localPath: 'C:\\fixtures\\repo-one' }];
+    const store = new Store(path, state); stores.push(store);
+    let source!: ReturnType<typeof store.native.register>;
+    store.commit('seed-source', () => { source = store.native.register('codex', 'C:\\fixtures\\codex-home', 'Fixture profile'); return 'observation.native_source_registered'; });
+    store.commit('seed-session', (current, now) => { store.native.discover(source, 'repo-one', [{ nativeSessionId: 'native-one', projectPath: 'C:\\fixtures\\repo-one', createdAt: now, updatedAt: now }], current, now); return 'observation.native_sessions_discovered'; });
+    const beforeHideCursor = store.snapshot().cursor;
+    expect(store.snapshot().state.repositories[0]).not.toHaveProperty('hiddenSessionCount');
+    const id = store.native.page(store.snapshot().state).items[0]!.id;
+
+    const afterHide = store.commit('hide-one', (current, now) => { store.native.visibility(id, false, current, now); return 'observation.native_visibility'; });
+    // snapshot() and commit()'s own returned snapshot both carry the live overlay...
+    expect(store.snapshot().state.repositories[0]?.hiddenSessionCount).toBe(1);
+    expect(afterHide.snapshot.state.repositories[0]?.hiddenSessionCount).toBe(1);
+    // ...and so does the state a subscriber (the live SSE push) receives for that same commit.
+    let pushed: Snapshot['state'] | undefined;
+    const unsubscribe = store.subscribe(event => { pushed = event.state; });
+    store.commit('hide-one-again-noop', () => 'observation.fixture-tick');
+    unsubscribe();
+    expect(pushed?.repositories[0]?.hiddenSessionCount).toBe(1);
+
+    // replay() intentionally omits it: a past cursor's "hidden right now" is not meaningful data about that
+    // earlier moment (see store.ts's own comment on replay()).
+    const replayed = store.replay(beforeHideCursor);
+    expect(replayed.length).toBeGreaterThan(0);
+    expect(replayed[0]!.state.repositories[0]).not.toHaveProperty('hiddenSessionCount');
+
+    // It is a read-time overlay only: the persisted patch/event and the raw town_state row never mention it.
+    const hideCursor = afterHide.snapshot.cursor;
+    stores.splice(stores.indexOf(store), 1); store.close();
+    const raw = new Database(path, { readonly: true });
+    try {
+      const row = raw.prepare('SELECT data FROM town_state WHERE id=?').get(state.workspace.id) as { data: string };
+      expect(JSON.parse(row.data).repositories[0]).not.toHaveProperty('hiddenSessionCount');
+      const patchRow = raw.prepare('SELECT data FROM events WHERE cursor=?').get(hideCursor) as { data: string };
+      expect(patchRow.data).not.toContain('hiddenSessionCount');
+    } finally { raw.close(); }
   });
 });
