@@ -524,7 +524,7 @@ pre.setup-code { margin: 12px 0 0; white-space: pre-wrap; overflow-wrap: anywher
    whichever drawer is actually open instead of guessing a single fixed width (REV-08). */
 @media (min-width: 900px) {
   .town-app:has(.drawer-right[open]) .room-context { left: auto; right: 463px; transform: none; width: min(560px, calc(100vw - 483px - 343px)); }
-  .town-app:has(.drawer-left[open]) .room-context { left: 363px; transform: none; }
+  .town-app:has(.drawer-left[open]) .room-context { left: 363px; transform: none; width: min(560px, calc(100vw - 363px - 483px)); }
   .town-app:has(.drawer-left[open]):has(.drawer-right[open]) .room-context { width: min(560px, calc(100vw - 363px - 483px)); }
 }
 .room-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; }

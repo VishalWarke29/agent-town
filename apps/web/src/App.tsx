@@ -208,6 +208,15 @@ export function App() {
     } else if (archiveMode === 'none' && previousArchiveMode.current !== 'none') camera('return');
     previousArchiveMode.current = archiveMode;
   }, [archiveMode, dbSchema.snapshot]);
+  // Every one of the many places that close or replace `selection` (Escape, backToTown,
+  // backToRepository, openRepository, openTracking, openWatch, camera('reset'), select() itself)
+  // only ever calls setSelection — none of them separately knew to reset archiveMode. Leaving the
+  // Archive by any of those routes (anything but its own drawer's close button, or re-clicking the
+  // already-active style) left archiveMode stale: reopening the Archive later skipped straight back
+  // to the same 3D visualization instead of its picker, and — since the effect above only returns the
+  // camera when archiveMode actually transitions to 'none' — the camera stayed zoomed into the archive
+  // view too. One effect here covers every current and future caller instead of patching each site.
+  useEffect(() => { if (!archiveSelected && archiveMode !== 'none') setArchiveMode('none'); }, [archiveSelected, archiveMode]);
   const [rosterOpen, setRosterOpen] = usePrivateState(privateState, false);
   const [trackingRepoId, setTrackingRepoId] = usePrivateState<string | null>(privateState, null);
   const [pendingRepoId, setPendingRepoId] = usePrivateState<string | null>(privateState, null);
